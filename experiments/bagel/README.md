@@ -57,6 +57,30 @@ multi-request `LLM/image_gen` forward contained requests at different loop
 indices. Passing this gate establishes only the tested batching primitive's
 GPU correctness evidence; it is not a throughput or scheduling-policy result.
 
+That gate completed on one A100-SXM4-80GB. The trace recorded 36 true
+multi-request heterogeneous-step image completions with maximum image batch
+size two. The two final-image comparisons had PSNR 46.21 dB and 42.54 dB;
+neither was bitwise identical. The observed B=2 refinement forward was only
+about 1.5% more throughput-efficient than two B=1 forwards, so branch-level
+work inside each request is the next performance target rather than a claim
+that request batching alone is sufficient.
+
+Step 4 is `notebooks/04_colab_bagel_cfg_branch_gate.ipynb`. It checks out the
+immutable implementation commit `5b637180a2041e0f39552a9c00a1f7573e44125e`
+and compares five request-selectable policies on one loaded server:
+
+- `reference`: unchanged three CFG rows on every refinement step;
+- `drop_image`: remove only an inactive image-guidance row;
+- `late_main`: keep the reference rows inside the CFG interval, then use main;
+- `auto`: use two rows through step 40 and main only for steps 41–48 under the
+  default text-to-image settings;
+- `main_only`: intentionally unguided negative control.
+
+The gate saves post-step latents at steps 0, 20, 40, 41, and 48, final images,
+execution traces, and a four-panel plot. Those latent dumps synchronize the GPU,
+so its timings diagnose potential only. Repeated timing runs must disable latent
+capture and follow only after the numerical gate is reviewed.
+
 The trace is enabled only when `MSTAR_EXECUTION_TRACE_DIR` is set by the
 profiling orchestrator. It does not add a synchronization beyond the worker's
 existing component-completion wait. A multi-request unbatchable component is

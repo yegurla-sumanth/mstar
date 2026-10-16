@@ -242,3 +242,49 @@ outside the comparison. Report request latency, first/last completion,
 makespan, ready waits, actual group sizes, total CUDA work, and correctness.
 The present single diagnostic run motivates that comparison but is not itself
 a performance claim.
+
+## 2026-10-16 — heterogeneous-step B=2 gate completes
+
+The Step 3 paired run completed on an A100-SXM4-80GB at candidate revision
+`ff4a90105bf8ffcd25f5554943bf54115c808a4e`. Its execution trace recorded 36
+`LLM/image_gen` completions that jointly advanced two requests at different
+refinement indices, out of 111 image-component completions. The maximum true
+image batch size was two.
+
+Both fixed-seed final images remained visually coherent, but neither was
+bitwise identical to its B=1 counterpart. Request 0 had PSNR 46.211 dB, mean
+absolute pixel error 0.417, and maximum error 87. Request 1 had PSNR 42.540 dB,
+mean absolute pixel error 0.666, and maximum error 172. This is positive
+end-result evidence for the tested primitive, not yet single-step latent parity
+or a universal numerical tolerance.
+
+The observed B=1 refinement median was about 0.819 seconds. A joint B=2 forward
+was about 1.614 seconds, only roughly 1.5% more throughput-efficient than two
+B=1 forwards. Request-level continuous batching therefore works, but this run
+does not show a large batching gain. It motivates measuring and removing
+algebraically inactive CFG branch work.
+
+## 2026-10-16 — Step 4 CFG branch-pruning gate prepared
+
+Branch `feature/bagel-cfg-branch-pruning` adds an explicit, request-overridable
+`cfg_branch_policy` while preserving `reference` as the default. The physical
+attention/KV plan now carries only the active branch labels. Under default
+text-to-image settings, `auto` derives two rows (`main`, `cfg_text`) for steps
+0–40 and one `main` row for steps 41–48; the boundary is computed from the
+shifted timestep and CFG interval rather than hard-coded.
+
+Local CPU validation passes 18 packing/CFG/policy tests. The three-row helper
+delegates exactly to the unchanged reference formula, inactive image-branch
+removal is exact in the synthetic formula test, and image editing retains all
+three branches when image guidance is active. Python compilation and Git
+whitespace checks pass. Full BAGEL import and GPU execution remain unverified
+locally because the Mac environment lacks Triton/CUDA.
+
+`notebooks/04_colab_bagel_cfg_branch_gate.ipynb` is pinned to implementation
+commit `5b637180a2041e0f39552a9c00a1f7573e44125e`. On one loaded server it runs
+`reference`, `drop_image`, `late_main`, `auto`, and an intentionally unguided
+`main_only` negative control with identical prompt/seed inputs. It saves
+post-step latents after steps 0, 20, 40, 41, and 48, final-image comparisons,
+per-step trace timing, and a four-panel plot. Latent dumping synchronizes the
+GPU, so this first gate cannot support a speedup claim. Repeated performance
+measurement will be a separate no-dump run after numerical review.
