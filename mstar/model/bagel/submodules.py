@@ -1366,6 +1366,49 @@ class LLMSubmodule(ARNodeSubmodule):
         """
         return shift * t / (1 + (shift - 1) * t)
 
+    @torch.compiler.disable
+    def _project_and_combine_cfg_velocities(
+        self,
+        hidden: torch.Tensor,
+        labels: tuple[str, ...],
+        sequence_span: int,
+        vae_token_indexes: torch.Tensor,
+        timestep: torch.Tensor,
+        latent_lens: list[int],
+        *,
+        cfg_text_scale: float,
+        cfg_img_scale: float,
+        cfg_interval: tuple[float, float] | list[float],
+        cfg_renorm_type: str,
+        cfg_renorm_min: float,
+    ) -> torch.Tensor:
+        """Project and combine a runtime-selected set of CFG branches.
+
+        This is intentionally a small Dynamo boundary. Policy requests change
+        the keys in ``branch_velocities`` (and ``auto`` changes them at the CFG
+        interval within one request). Keeping construction and consumption of
+        that mapping in ordinary Python prevents a graph traced for the
+        three-branch reference from retaining a ``cfg_img`` lookup when the
+        next step physically carries only two or one branches. The expensive
+        transformer forward immediately before this helper stays compiled.
+        """
+        branch_velocities = {
+            label: self.llm2vae(
+                hidden[i * sequence_span:(i + 1) * sequence_span]
+            )[vae_token_indexes]
+            for i, label in enumerate(labels)
+        }
+        return combine_pruned_cfg_velocities(
+            branch_velocities,
+            timestep,
+            latent_lens,
+            cfg_text_scale=cfg_text_scale,
+            cfg_img_scale=cfg_img_scale,
+            cfg_interval=cfg_interval,
+            cfg_renorm_type=cfg_renorm_type,
+            cfg_renorm_min=cfg_renorm_min,
+        )
+
     def _forward_image_gen(
         self,
         input_embeds: torch.Tensor,
@@ -1496,14 +1539,11 @@ class LLMSubmodule(ARNodeSubmodule):
             text_mask=batched_text_mask,
             **kwargs,
         )
-        branch_velocities = {
-            label: self.llm2vae(hidden[i * S:(i + 1) * S])[
-                vae_token_indexes
-            ]
-            for i, label in enumerate(labels)
-        }
-        v_final = combine_pruned_cfg_velocities(
-            branch_velocities,
+        v_final = self._project_and_combine_cfg_velocities(
+            hidden,
+            labels,
+            S,
+            vae_token_indexes,
             timestep,
             latent_lens,
             cfg_text_scale=cfg_text_scale,
