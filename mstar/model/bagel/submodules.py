@@ -1174,9 +1174,7 @@ class LLMSubmodule(ARNodeSubmodule):
             return self._forward_prefill_vae(**kwargs)
         elif graph_walk == "image_gen":
             out = self._forward_image_gen(**kwargs)
-            self._maybe_dump_image_latents(
-                engine_inputs.request_ids[0], request_info, out
-            )
+            self._maybe_dump_image_latents(request_info, out)
             return out
         elif graph_walk == "image_gen_cfg":
             return self._forward_image_gen_single_branch(**kwargs)
@@ -1198,7 +1196,6 @@ class LLMSubmodule(ARNodeSubmodule):
 
     @staticmethod
     def _maybe_dump_image_latents(
-        request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: NameToTensorList,
     ) -> None:
@@ -1223,6 +1220,12 @@ class LLMSubmodule(ARNodeSubmodule):
         }
         if step not in selected:
             return
+        # ``engine_inputs.request_ids`` contains worker-local integer handles.
+        # The wire identity is retained on CurrentForwardPassInfo and is what
+        # the client summary and analyzer use. Dumping under the handle would
+        # make sequential requests overwrite one another (normally under
+        # ``debug_latents/0`` after the previous request is retired).
+        request_id = request_info.request_id
         safe_request_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(request_id))
         request_dir = Path(root) / safe_request_id
         request_dir.mkdir(parents=True, exist_ok=True)
@@ -1737,7 +1740,6 @@ class LLMSubmodule(ARNodeSubmodule):
             )
             for request_id in request_ids:
                 self._maybe_dump_image_latents(
-                    request_id,
                     engine_inputs.per_request_info[request_id],
                     split[request_id],
                 )

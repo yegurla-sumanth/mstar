@@ -7,7 +7,12 @@ must never address the first request's BOI/latent/EOI block.
 
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -19,7 +24,10 @@ from mstar.model.bagel.batching import (
     shifted_timestep_for_step,
     split_image_gen_outputs,
 )
-from mstar.model.bagel.submodules import _store_projected_image_latents
+from mstar.model.bagel.submodules import (
+    LLMSubmodule,
+    _store_projected_image_latents,
+)
 from mstar.model.submodule_base import ARNodeInputs
 
 
@@ -46,6 +54,39 @@ def _row(*, value: float, time_index: int, latent_len: int = 3) -> ARNodeInputs:
 
 
 class ImageBatchPackingTest(unittest.TestCase):
+    def test_debug_latents_use_wire_request_id_not_recycled_handle(self):
+        outputs = {
+            "latents": [torch.tensor([[1.0, 2.0]])],
+            "time_index": [torch.tensor([7])],
+        }
+        info = SimpleNamespace(
+            request_id="bagel-cfg-reference-r00-run",
+            dynamic_loop_iter_counts={"image_gen_loop": 20},
+            step_metadata={"cfg_branch_policy": "reference"},
+        )
+
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+            os.environ,
+            {
+                "MSTAR_BAGEL_DEBUG_LATENT_DIR": root,
+                "MSTAR_BAGEL_DEBUG_LATENT_STEPS": "20",
+            },
+        ):
+            LLMSubmodule._maybe_dump_image_latents(info, outputs)
+            path = (
+                Path(root)
+                / "bagel-cfg-reference-r00-run"
+                / "after_step_20.pt"
+            )
+            self.assertTrue(path.is_file())
+            payload = torch.load(path, weights_only=True)
+
+        self.assertEqual(
+            payload["request_id"], "bagel-cfg-reference-r00-run"
+        )
+        self.assertEqual(payload["step_index"], 20)
+        torch.testing.assert_close(payload["latents"], outputs["latents"][0])
+
     def test_projected_latents_are_stored_in_sequence_dtype(self):
         combined = torch.zeros((5, 2), dtype=torch.float32)
         indexes = torch.tensor([1, 2, 3])
