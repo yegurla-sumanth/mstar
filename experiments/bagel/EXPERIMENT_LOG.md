@@ -312,3 +312,23 @@ revision and labels the next run as eager correctness only. Python syntax and
 Git whitespace checks pass locally; the new tensor regression test and the
 full gate still require the CUDA environment. Compiled performance remains a
 separate unresolved gate.
+
+## 2026-10-16 — Step 4 eager policy execution succeeded; latent analysis bug
+
+The eager A100 retry completed its warm-up and all five policy requests. The
+client summary reports exact final-image SHA-256 equality for `reference`
+versus `drop_image`, and for `late_main` versus `auto`. Diagnostic client times
+were 45.238 seconds for `reference`, 31.041 for `drop_image`, 40.665 for
+`late_main`, 28.784 for `auto`, and 16.929 for the deliberately unguided
+`main_only` control. These synchronized eager measurements characterize
+potential only and are not performance evidence.
+
+Post-processing failed after request completion because the latent dumper used
+the worker-local integer request handle. Each sequential request reused handle
+zero and overwrote the preceding request's five files under
+`debug_latents/0`. Revision `eb7327801785202639cdbdb9d63e5dad265f3290`
+instead uses `CurrentForwardPassInfo.request_id`, the stable wire identity also
+recorded by the client summary, and adds a regression test for the resulting
+path. The Step 4 notebook is pinned to this revision for the reduced latent
+correctness rerun. The five policy images and traces from the completed retry
+remain valid; only cross-policy intermediate-latent comparisons are missing.

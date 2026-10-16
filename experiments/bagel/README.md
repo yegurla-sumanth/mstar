@@ -66,7 +66,7 @@ work inside each request is the next performance target rather than a claim
 that request batching alone is sufficient.
 
 Step 4 is `notebooks/04_colab_bagel_cfg_branch_gate.ipynb`. It checks out the
-immutable implementation commit `5b637180a2041e0f39552a9c00a1f7573e44125e`
+immutable implementation commit `eb7327801785202639cdbdb9d63e5dad265f3290`
 and compares five request-selectable policies on one loaded server:
 
 - `reference`: unchanged three CFG rows on every refinement step;
