@@ -347,6 +347,39 @@ class CFGBranchPruningTest(unittest.TestCase):
 
         self.assertIs(actual, main)
 
+    def test_compiled_caller_can_change_active_branch_mapping(self):
+        """A three-row warm-up must not specialize later pruned calls."""
+        main = torch.tensor([[1.0, 2.0], [2.0, 1.0]])
+        text = torch.tensor([[0.5, 0.0], [0.0, 0.5]])
+        image = torch.tensor([[0.25, 0.25], [0.25, 0.25]])
+        early_timestep = torch.full((2,), 0.8)
+        late_timestep = torch.full((2,), 0.2)
+        kwargs = dict(
+            cfg_text_scale=4.0,
+            cfg_img_scale=1.0,
+            cfg_interval=(0.4, 1.0),
+            cfg_renorm_type="global",
+            cfg_renorm_min=0.0,
+        )
+
+        def caller(branches, timestep):
+            return combine_pruned_cfg_velocities(
+                branches, timestep, [2], **kwargs
+            )
+
+        compiled = torch.compile(caller, backend="eager", fullgraph=False)
+        reference = compiled(
+            {"main": main, "cfg_text": text, "cfg_img": image},
+            early_timestep,
+        )
+        drop_image = compiled(
+            {"main": main, "cfg_text": text}, early_timestep
+        )
+        main_only = compiled({"main": main}, late_timestep)
+
+        torch.testing.assert_close(drop_image, reference)
+        self.assertIs(main_only, main)
+
 
 class ImageBatchOutputSplittingTest(unittest.TestCase):
     def test_outputs_return_to_their_request_ids(self):

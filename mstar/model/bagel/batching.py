@@ -285,6 +285,7 @@ def combine_cfg_velocities(
     return torch.cat(outputs)
 
 
+@torch.compiler.disable
 def combine_pruned_cfg_velocities(
     branch_velocities: Mapping[str, torch.Tensor],
     timestep: torch.Tensor,
@@ -301,6 +302,13 @@ def combine_pruned_cfg_velocities(
     With all three branches this delegates to the untouched reference helper.
     With only ``main`` it returns that velocity directly. Intermediate label
     sets retain the reference arithmetic for every branch that was executed.
+
+    Keep this small control-plane helper outside Dynamo. The active mapping
+    changes between policy requests (and, for ``auto``, within one request).
+    Compiling a prior three-branch call can otherwise retain the
+    ``cfg_img`` lookup when the next call supplies only ``main`` and
+    ``cfg_text``. The transformer and branch projections around this helper
+    remain compiled; only the inexpensive CFG combination runs eagerly.
     """
     labels = tuple(
         label for label in CFG_BRANCH_ORDER if label in branch_velocities
