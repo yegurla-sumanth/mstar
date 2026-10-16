@@ -54,3 +54,24 @@ and Colab cost.
 - Actual checkpoint download size and cold server-start duration.
 - Peak device and host memory for the unchanged single-image request.
 - Whether Nsight Systems and CUDA tracing are usable in Colab.
+
+## 2026-10-16 — first Colab request attempt
+
+### Observation
+
+Run `smoke_20261016T043358Z` reached a healthy server and submitted the fixed
+image-generation request. During FlashInfer attention planning, its first-use
+JIT path tried to execute `ninja` and failed with `FileNotFoundError`. M*
+reported the worker failure to the client as HTTP 500. No request profile or
+image was produced, so this attempt does not satisfy the baseline milestone.
+The orchestrator proceeded through its server-shutdown path.
+
+### Diagnosis and repair
+
+The BAGEL optional dependency set did not request `ninja`; naming it in a
+constraints file only pins the package if another requirement selects it. In
+addition, invoking a virtual environment's Python by absolute path does not
+activate that environment's `bin` directory on `PATH`. The repair adds
+`ninja` to the BAGEL dependencies, checks its executable during notebook
+setup, and prepends the active interpreter's directory to the server process
+`PATH`. The checkpoint cache can be reused for the retry.

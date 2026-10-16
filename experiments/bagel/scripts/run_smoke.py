@@ -155,10 +155,17 @@ def main() -> int:
         str(args.request_timeout_seconds),
     ]
     env = os.environ.copy()
+    venv_bin = str(Path(sys.executable).resolve().parent)
+    inherited_path = env.get("PATH")
     env.update(
         {
             "CUDA_VISIBLE_DEVICES": "0",
             "MSTAR_RUST_ZMQ": "0",
+            "PATH": (
+                venv_bin
+                if not inherited_path
+                else os.pathsep.join((venv_bin, inherited_path))
+            ),
             "PYTHONUNBUFFERED": "1",
         }
     )
@@ -178,7 +185,8 @@ def main() -> int:
         "server_command": server_command,
         "smoke_command": smoke_command,
         "environment_overrides": {
-            key: env[key] for key in ("CUDA_VISIBLE_DEVICES", "MSTAR_RUST_ZMQ", "PYTHONUNBUFFERED")
+            key: env[key]
+            for key in ("CUDA_VISIBLE_DEVICES", "MSTAR_RUST_ZMQ", "PATH", "PYTHONUNBUFFERED")
         },
         "nvidia_smi_before": command_result(["nvidia-smi"], repo_root),
     }
