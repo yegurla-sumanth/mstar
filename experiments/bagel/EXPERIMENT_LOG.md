@@ -97,6 +97,7 @@ subsequent commit `61c43b47c63c6da623045e7a4a7709a93f8eaf05`.
 
 The smoke client only returns success after receiving exactly one nonempty
 image and decoding it as a PNG with the requested dimensions. This satisfies
-the technical setup/correctness gate. A human visual-semantic check of the
-saved image remains separate. The server-ready and request times include cold
-loading and first-use compilation and are not warmed performance results.
+the technical setup/correctness gate. Sumanth subsequently confirmed that the
+saved image was visually coherent, completing the Step 1 baseline gate. The
+server-ready and request times include cold loading and first-use compilation
+and are not warmed performance results.
