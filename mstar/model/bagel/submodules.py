@@ -23,6 +23,7 @@ from mstar.engine.cuda_graph_config import (
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.model.bagel.batching import collate_image_gen_inputs
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -1035,12 +1036,18 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> dict[str, torch.Tensor | Any]:
         """Data transform for the forward; the plans come from the step
         declaration the runner drives before this runs."""
-        if graph_walk in ("image_gen", "image_gen_cfg"):
-            assert len(inputs) == 1 , "Batching not supported for image gen"
-
-        # Concatenate lists of tensors into single tensors for each input name
-        result = ARNodeInputs.collate(inputs, stacking_method=StackingMethod.CAT)
-        result["seq_lens"] = [inp.input_seq_len for inp in inputs]
+        if graph_walk == "image_gen":
+            result = collate_image_gen_inputs(inputs)
+        else:
+            if graph_walk == "image_gen_cfg":
+                assert len(inputs) == 1, (
+                    "Batching not yet supported for CFG-parallel image gen"
+                )
+            # Concatenate lists of tensors into single tensors for each input name
+            result = ARNodeInputs.collate(
+                inputs, stacking_method=StackingMethod.CAT
+            )
+            result["seq_lens"] = [inp.input_seq_len for inp in inputs]
         # Off the inputs, the same way `declare_step` reads it, so the forward
         # and the step it was declared under cannot disagree during capture, which
         # passes in dummy metadata
