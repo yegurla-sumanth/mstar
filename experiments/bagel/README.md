@@ -48,6 +48,15 @@ and displays four plots:
 - refinement CUDA time by scheduler group size beside per-request prompt and
   VAE ready waits, separating true model batching from scheduler grouping.
 
+The experimental Step 3 correctness gate is
+`notebooks/03_colab_bagel_heterogeneous_batch_parity.ipynb`. It checks out the
+immutable prototype commit `ff4a90105bf8ffcd25f5554943bf54115c808a4e`, runs
+paired serial B=1 and heterogeneous B=2 profiles with two staggered requests,
+compares their final images, and requires trace evidence that a real
+multi-request `LLM/image_gen` forward contained requests at different loop
+indices. Passing this gate establishes only the tested batching primitive's
+GPU correctness evidence; it is not a throughput or scheduling-policy result.
+
 The trace is enabled only when `MSTAR_EXECUTION_TRACE_DIR` is set by the
 profiling orchestrator. It does not add a synchronization beyond the worker's
 existing component-completion wait. A multi-request unbatchable component is
