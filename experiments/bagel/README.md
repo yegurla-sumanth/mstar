@@ -81,6 +81,23 @@ execution traces, and a four-panel plot. Those latent dumps synchronize the GPU,
 so its timings diagnose potential only. Repeated timing runs must disable latent
 capture and follow only after the numerical gate is reviewed.
 
+Step 5 is `notebooks/05_colab_bagel_cfg_branch_performance.ipynb`, pinned to
+implementation commit `b22e8bc2be7297e6cf636d369f442923c73a5d70`. It measures
+only the exact `drop_image` optimization against `reference`: both shapes receive
+one warm-up, then five B=1 pairs run in alternating order with distinct paired
+seeds and no latent capture. Every pair must retain exact final PNG equality.
+The worker trace now records the active CFG labels and virtual row count directly
+from each prepared image-step input, rather than reconstructing them only from
+the requested policy. The analysis reports client and refinement-CUDA medians,
+quartiles, sample standard deviations, paired speedups, sampled GPU telemetry,
+and a four-panel plot.
+
+This is an explicitly bounded eager-path pilot: `TORCH_COMPILE_DISABLE=1` remains
+set because compiled dynamic branch pruning has not passed correctness. It also
+uses sequential B=1 requests, so it does not measure continuous batching. The
+notebook stores Hugging Face and `uv` caches on Drive so later fresh runtimes can
+reuse downloads; the first Step 5 run may still have to populate those caches.
+
 The trace is enabled only when `MSTAR_EXECUTION_TRACE_DIR` is set by the
 profiling orchestrator. It does not add a synchronization beyond the worker's
 existing component-completion wait. A multi-request unbatchable component is

@@ -379,3 +379,29 @@ labels directly; the virtual-row count is derived from the tested policy and
 implementation. A reportable performance run needs direct active-row trace
 metadata, no latent dumping, multiple paired repeats, and either a repaired
 compiled path or an explicitly bounded eager-only claim.
+
+## 2026-10-16 — Step 5 paired eager performance pilot prepared
+
+Revision `b22e8bc2be7297e6cf636d369f442923c73a5d70` adds the bounded
+performance experiment selected after the Step 4 numerical review. It compares
+only `reference` with the exact `drop_image` policy. One loaded server warms both
+policy shapes, then runs five paired seeds in alternating order. Latent capture
+is absent, image batch size remains one, and `TORCH_COMPILE_DISABLE=1` makes the
+claim explicitly eager-only. Each pair must produce equal final PNG hashes.
+
+The generic execution trace now accepts model-specific, JSON-serializable
+control-plane metadata from prepared inputs. BAGEL uses it to record active CFG
+labels and virtual row counts for every `LLM/image_gen` completion without
+reading tensor values or synchronizing the device. The analyzer requires all 49
+refinement steps per request and verifies every observed branch schedule before
+reporting timing. It summarizes full-request and refinement-CUDA distributions,
+paired speedups and seconds saved, and request-window `nvidia-smi` samples.
+
+`notebooks/05_colab_bagel_cfg_branch_performance.ipynb` is pinned to that
+implementation revision. The notebook also moves the Hugging Face and `uv`
+caches to Drive for reuse across fresh Colab runtimes. Its first run remains
+unmeasured locally: Python syntax, notebook JSON/code-cell compilation, the
+execution-trace unit tests, and Git whitespace checks pass; the BAGEL tests and
+full A100 experiment require the pinned CUDA environment. This experiment does
+not repair or evaluate compiled pruning and does not combine the optimization
+with heterogeneous continuous batching.
