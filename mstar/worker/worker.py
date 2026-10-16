@@ -51,6 +51,7 @@ from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
+from mstar.profile.execution_trace import ExecutionTrace
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 from mstar.utils.containers import ParallelList, RecentSet
@@ -301,6 +302,7 @@ class Worker:
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = nvtx_enabled(enable_nvtx, device)
+        self.execution_trace = ExecutionTrace(worker_id)
         # (node, walk) -> the loop-back signals the node keeps on the device
         self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
         self._host_rows_slot = 0
@@ -474,7 +476,8 @@ class Worker:
 
         self.scheduler = MicroScheduler(
             self.engine_manager,
-            parallel_leader_nodes=self.parallel_leader_nodes
+            parallel_leader_nodes=self.parallel_leader_nodes,
+            execution_trace=self.execution_trace,
         )
 
         # Request ids are strings on the wire and ints (handles) inside this
@@ -680,6 +683,13 @@ class Worker:
             worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
         )
         body.request_info.rid_handle = request_id
+        self.execution_trace.record(
+            "request_mapping",
+            request_handle=request_id,
+            request_id=body.request_id,
+            graph_walk=body.request_info.graph_walk,
+            partition=body.request_info.partition_name,
+        )
 
         now = _time.monotonic()
         for node_name in self.engine_manager.evictable_nodes():
@@ -1434,6 +1444,10 @@ class Worker:
             final_edges=final_edges,
             per_request_input_metadata=per_request_input_metadata,
         )
+        node_batch.trace_batch_id = batch.trace_batch_id
+        node_batch.trace_scheduled_ns = batch.trace_scheduled_ns
+        node_batch.trace_ready_ns = dict(batch.trace_ready_ns)
+        node_batch.trace_speculative = batch.trace_speculative
         for rid in unresolved:
             # Reported the way a per-rid stage reports: left in
             # ``failed_requests`` for the run loop to drop and fail, so the
@@ -1580,6 +1594,56 @@ class Worker:
     # ------------------------------------------------------------------
     # Output handling
     # ------------------------------------------------------------------
+    def _trace_wire_request_ids(self, request_ids: Iterable[int]) -> list[str]:
+        wire_ids = []
+        for request_id in request_ids:
+            try:
+                wire_ids.append(self._rid_str(request_id))
+            except (KeyError, RuntimeError):
+                wire_ids.append(f"removed-handle-{request_id}")
+        return wire_ids
+
+    def _prepare_trace_batch(
+        self,
+        batch: ScheduledBatch,
+        node_batch: ExecutingBatch | None = None,
+        *,
+        speculative: bool,
+    ) -> None:
+        """Attach diagnostic identity and scheduler-wait evidence to a batch."""
+        if not self.execution_trace.enabled or batch.trace_batch_id is not None:
+            return
+        request_ids = list(batch.request_to_worker_graph)
+        scheduled_ns = _time.perf_counter_ns()
+        ready_ns = self.scheduler.take_trace_ready_times(
+            batch.node_name, batch.graph_walk, request_ids,
+        )
+        batch.trace_batch_id = self.execution_trace.next_batch_id()
+        batch.trace_scheduled_ns = scheduled_ns
+        batch.trace_ready_ns = ready_ns
+        batch.trace_speculative = speculative
+        if node_batch is not None:
+            node_batch.trace_batch_id = batch.trace_batch_id
+            node_batch.trace_scheduled_ns = scheduled_ns
+            node_batch.trace_ready_ns = dict(ready_ns)
+            node_batch.trace_speculative = speculative
+        self.execution_trace.record(
+            "batch_scheduled",
+            batch_id=batch.trace_batch_id,
+            node_name=batch.node_name,
+            graph_walk=batch.graph_walk,
+            request_handles=request_ids,
+            request_ids=self._trace_wire_request_ids(request_ids),
+            batch_size=len(request_ids),
+            speculative=speculative,
+            scheduled_ns=scheduled_ns,
+            ready_observed_ns={str(rid): ns for rid, ns in ready_ns.items()},
+            ready_wait_ms={
+                str(rid): (scheduled_ns - ns) / 1e6
+                for rid, ns in ready_ns.items()
+            },
+        )
+
     def _push_back_batch(self, batch: ScheduledBatch) -> None:
         """Return a whole batch's nodes to the ready set (admit refusal, OOM)."""
         rids = list(batch.request_to_worker_graph)
@@ -1893,6 +1957,30 @@ class Worker:
                 if self.device.type != "cpu"
                 else None
             )
+            if self.execution_trace.enabled:
+                node_batch.trace_component_start_ns = _time.perf_counter_ns()
+                self.execution_trace.record(
+                    "component_start",
+                    batch_id=batch.trace_batch_id,
+                    node_name=batch.node_name,
+                    graph_walk=batch.graph_walk,
+                    request_handles=list(node_batch.request_ids),
+                    request_ids=self._trace_wire_request_ids(
+                        node_batch.request_ids
+                    ),
+                    batch_size=len(node_batch.request_ids),
+                    speculative=batch.trace_speculative,
+                    scheduled_ns=batch.trace_scheduled_ns,
+                    ready_observed_ns={
+                        str(rid): ns for rid, ns in batch.trace_ready_ns.items()
+                    },
+                    component_start_ns=node_batch.trace_component_start_ns,
+                )
+                if execution_stream is not None:
+                    node_batch.trace_cuda_start_event = torch.Event(
+                        enable_timing=True
+                    )
+                    node_batch.trace_cuda_start_event.record(execution_stream)
             # Device time of the step; the phase timers only see host submit
             # time, and both are needed to tell a starved iter from a busy one.
             gpu_start = None
@@ -1906,9 +1994,25 @@ class Worker:
                     f"rows.{batch.graph_walk}#", len(node_batch.request_ids),
                 )
             with self._span("worker.gpu_thread.exec"):
-                outputs = engine.exec_and_postprocess(node_batch)
+                try:
+                    outputs = engine.exec_and_postprocess(node_batch)
+                except Exception as exc:
+                    self.execution_trace.record(
+                        "component_error",
+                        batch_id=batch.trace_batch_id,
+                        node_name=batch.node_name,
+                        graph_walk=batch.graph_walk,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    raise
             if execution_stream is not None:
                 self._stage_host_rows(outputs)
+                if self.execution_trace.enabled:
+                    node_batch.trace_cuda_end_event = torch.Event(
+                        enable_timing=True
+                    )
+                    node_batch.trace_cuda_end_event.record(execution_stream)
                 event = torch.Event()
                 event.record(execution_stream)
                 node_batch.completion_event = event
@@ -1917,6 +2021,13 @@ class Worker:
                     gpu_end.record(execution_stream)
                     self._gpu_spans.append((gpu_start, gpu_end))
                     self._drain_gpu_spans()
+            self.execution_trace.record(
+                "component_enqueued",
+                batch_id=batch.trace_batch_id,
+                node_name=batch.node_name,
+                graph_walk=batch.graph_walk,
+                enqueue_finished_ns=_time.perf_counter_ns(),
+            )
             return outputs
         finally:
             # Safety net: a step that raised before the forward would otherwise
@@ -2888,6 +2999,39 @@ class Worker:
 
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
+
+        if self.execution_trace.enabled:
+            completed_ns = _time.perf_counter_ns()
+            cuda_duration_ms = None
+            if (
+                batch_N.node_batch.trace_cuda_start_event is not None
+                and batch_N.node_batch.trace_cuda_end_event is not None
+            ):
+                cuda_duration_ms = batch_N.node_batch.trace_cuda_start_event.elapsed_time(
+                    batch_N.node_batch.trace_cuda_end_event
+                )
+            request_ids = list(batch_N.node_batch.request_ids)
+            self.execution_trace.record(
+                "component_complete",
+                batch_id=batch_N.batch.trace_batch_id,
+                node_name=batch_N.node_name,
+                graph_walk=batch_N.graph_walk,
+                request_handles=request_ids,
+                request_ids=self._trace_wire_request_ids(request_ids),
+                batch_size=len(request_ids),
+                speculative=batch_N.batch.trace_speculative,
+                component_start_ns=batch_N.node_batch.trace_component_start_ns,
+                gpu_complete_ns=completed_ns,
+                component_wall_ms=(
+                    None
+                    if batch_N.node_batch.trace_component_start_ns is None
+                    else (
+                        completed_ns - batch_N.node_batch.trace_component_start_ns
+                    )
+                    / 1e6
+                ),
+                cuda_duration_ms=cuda_duration_ms,
+            )
 
         _pp_stage("completion_event_sync")
         if self.enable_nvtx:
@@ -4086,6 +4230,11 @@ class Worker:
                         )
 
                         if spec_batch.request_to_worker_graph:
+                            self._prepare_trace_batch(
+                                spec_batch,
+                                spec_node_batch,
+                                speculative=True,
+                            )
                             if self.enable_nvtx:
                                 range_push("worker.submit_spec", synchronize=False)
                             _t0 = _time.perf_counter() if phase_period else 0.0
@@ -4182,6 +4331,7 @@ class Worker:
                     self.communicator.wait_for_work(10)
                     continue
 
+                self._prepare_trace_batch(batch, speculative=False)
                 if self.enable_nvtx:
                     range_push("worker.build_node_batch", synchronize=False)
                 node_batch = self._build_executing_batch(batch)

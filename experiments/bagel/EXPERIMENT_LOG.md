@@ -101,3 +101,42 @@ the technical setup/correctness gate. Sumanth subsequently confirmed that the
 saved image was visually coherent, completing the Step 1 baseline gate. The
 server-ready and request times include cold loading and first-use compilation
 and are not warmed performance results.
+
+## 2026-10-16 — Step 2 staggered-profile design
+
+### Decision
+
+The first profiling run will use the unchanged single-GPU placement with one
+unmeasured warm-up followed by six measured requests submitted eight seconds
+apart. Each request keeps the normal 1024x1024, 49-refinement-step workload.
+This is deliberately larger than the smoke test but remains an instrumentation
+debug run, not the sample size for a performance claim.
+
+The opt-in trace records when M* first observes a component as ready, when it
+schedules that component, its worker-side service window, its CUDA-event
+duration, batch membership, and request order. Client submission/completion
+and one-second `nvidia-smi` samples provide aligned request and GPU context.
+The analysis notebook produces request, scheduler-component, and GPU-telemetry
+plots and retains the raw JSON/JSONL evidence in Drive.
+
+### Prediction
+
+If the current single-worker execution path serializes independent BAGEL
+components, the trace will show non-overlapping component CUDA intervals. As
+the stagger creates mixed-age requests, at least some ready work may wait while
+another request's component executes; those intervals will appear as dashed
+ready-to-scheduled spans. If VAE decode and another request's LLM refinement
+already overlap—or if ready components consistently schedule without a
+meaningful wait—that observation weakens the proposed overlap/scheduling
+motivation and must redirect the next experiment.
+
+### Evidence boundary and next gate
+
+Tracing is diagnostic instrumentation and may perturb host scheduling. A
+multi-request unbatchable component is timed as one scheduler batch, with its
+ordered request IDs retained but without separate sub-request GPU intervals.
+The six-request result will validate the trace and expose execution order; it
+will not support throughput or tail-latency conclusions. After inspecting it,
+choose arrival patterns and a larger paired repeat count based on warmed
+latency, memory headroom, and observed variability before implementing any
+concurrency mechanism.

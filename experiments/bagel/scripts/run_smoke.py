@@ -155,7 +155,10 @@ def main() -> int:
         str(args.request_timeout_seconds),
     ]
     env = os.environ.copy()
-    venv_bin = str(Path(sys.executable).resolve().parent)
+    # Keep the invoked interpreter path instead of resolving its symlink: uv
+    # virtual environments may point at a system interpreter, while tools such
+    # as ninja are installed beside the venv's Python executable.
+    venv_bin = str(Path(sys.executable).parent)
     inherited_path = env.get("PATH")
     env.update(
         {

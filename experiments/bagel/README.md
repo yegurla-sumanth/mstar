@@ -35,10 +35,31 @@ runtime and run cells in order. The notebook:
 The scripts can also be run directly from an allocated Linux/NVIDIA host. Use
 `python experiments/bagel/scripts/<script>.py --help` for their interfaces.
 
+After the smoke gate succeeds, run
+`notebooks/02_colab_bagel_staggered_profile.ipynb`. It performs one warm-up
+request, then submits six measured requests eight seconds apart. The opt-in
+worker trace records scheduler-ready, scheduled, component-start, and
+component-complete events, including CUDA-event durations. The notebook saves
+and displays three aligned plots:
+
+- per-request component and ready-to-scheduled timelines;
+- M* component lanes with service windows and CUDA activity;
+- externally sampled GPU utilization and total device-memory use.
+
+The trace is enabled only when `MSTAR_EXECUTION_TRACE_DIR` is set by the
+profiling orchestrator. It does not add a synchronization beyond the worker's
+existing component-completion wait. A multi-request unbatchable component is
+represented as one scheduler batch; the ordered `request_ids` field records
+its internal per-request execution order, while the plotted interval covers
+the full batch rather than separate sub-request GPU intervals.
+
 ## Evidence boundary
 
 The smoke run separates installation, server health, request success, and
 image validation. Its latency includes cold compilation and is not a headline
-measurement. A later profiling run will use a few staggered requests to debug
-the timeline, followed by a larger repeated characterization before any
-concurrency or scheduling conclusion.
+measurement. The six-request profiling run is likewise a diagnostic check of
+the workload and instrumentation. It can reveal component order, observed
+ready-to-scheduled waits, and whether the single worker's recorded CUDA
+intervals overlap; it cannot establish throughput, tail latency, or the value
+of a scheduling change. Those claims require a larger repeated
+characterization with paired runs and controlled arrival patterns.

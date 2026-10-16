@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Launch M*, run the staggered BAGEL trace workload, and stop all children."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from run_smoke import (
+    atomic_json,
+    command_result,
+    file_sha256,
+    healthy,
+    stop_process_group,
+    tail,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("experiments/bagel/configs/bagel_single_gpu_pinned.yaml"),
+    )
+    parser.add_argument("--cache-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--num-requests", type=int, default=6)
+    parser.add_argument("--stagger-seconds", type=float, default=8.0)
+    parser.add_argument("--server-start-timeout-seconds", type=float, default=1800.0)
+    parser.add_argument("--shutdown-timeout-seconds", type=float, default=90.0)
+    parser.add_argument("--request-timeout-seconds", type=float, default=1800.0)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    repo_root = args.repo_root.resolve()
+    config = args.config if args.config.is_absolute() else repo_root / args.config
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    trace_dir = output_dir / "execution_trace"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    server_log_path = output_dir / "server.log"
+    request_profiles_path = output_dir / "request_profiles.log"
+    client_log_path = output_dir / "profile_client.log"
+    summary_path = output_dir / "run_summary.json"
+    base_url = f"http://127.0.0.1:{args.port}"
+    unique = f"{os.getpid()}_{int(time.time())}"
+    socket_prefix = f"/tmp/mstar_bagel_profile_{unique}/"
+    upload_dir = f"/tmp/mstar_bagel_profile_uploads_{unique}/"
+    server_command = [
+        sys.executable,
+        "-m",
+        "mstar.api_server.entrypoint",
+        "--config",
+        str(config),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(args.port),
+        "--cache-dir",
+        str(args.cache_dir.resolve()),
+        "--socket-path-prefix",
+        socket_prefix,
+        "--upload-dir",
+        upload_dir,
+        "--tensor-comm-protocol",
+        "SHM",
+        "--timeout",
+        str(args.request_timeout_seconds),
+        "--log-stats-file",
+        str(request_profiles_path),
+    ]
+    client_command = [
+        sys.executable,
+        str(repo_root / "experiments/bagel/scripts/profile_staggered.py"),
+        "--base-url",
+        base_url,
+        "--output-dir",
+        str(output_dir),
+        "--num-requests",
+        str(args.num_requests),
+        "--stagger-seconds",
+        str(args.stagger_seconds),
+        "--timeout-seconds",
+        str(args.request_timeout_seconds),
+    ]
+    env = os.environ.copy()
+    # Keep the invoked interpreter path instead of resolving its symlink: uv
+    # virtual environments may point at a system interpreter, while tools such
+    # as ninja are installed beside the venv's Python executable.
+    venv_bin = str(Path(sys.executable).parent)
+    inherited_path = env.get("PATH")
+    env.update(
+        {
+            "CUDA_VISIBLE_DEVICES": "0",
+            "MSTAR_EXECUTION_TRACE_DIR": str(trace_dir),
+            "MSTAR_RUST_ZMQ": "0",
+            "PATH": (venv_bin if not inherited_path else os.pathsep.join((venv_bin, inherited_path))),
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
+    started_utc = datetime.now(timezone.utc)
+    summary = {
+        "status": "failed",
+        "started_utc": started_utc.isoformat(),
+        "repo": {
+            "head": command_result(["git", "rev-parse", "HEAD"], repo_root),
+            "branch": command_result(["git", "branch", "--show-current"], repo_root),
+            "status": command_result(["git", "status", "--porcelain=v1"], repo_root),
+        },
+        "config": {"path": str(config), "sha256": file_sha256(config)},
+        "workload": {
+            "warmup_requests": 1,
+            "measured_requests": args.num_requests,
+            "stagger_seconds": args.stagger_seconds,
+        },
+        "server_command": server_command,
+        "client_command": client_command,
+        "environment_overrides": {
+            key: env[key]
+            for key in (
+                "CUDA_VISIBLE_DEVICES",
+                "MSTAR_EXECUTION_TRACE_DIR",
+                "MSTAR_RUST_ZMQ",
+                "PATH",
+                "PYTHONUNBUFFERED",
+            )
+        },
+        "nvidia_smi_before": command_result(["nvidia-smi"], repo_root),
+    }
+    atomic_json(summary_path, summary)
+    process = None
+    caught: Exception | None = None
+    server_log = server_log_path.open("ab", buffering=0)
+    try:
+        server_started = time.perf_counter()
+        process = subprocess.Popen(
+            server_command,
+            cwd=repo_root,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        summary["server_pid"] = process.pid
+        deadline = time.monotonic() + args.server_start_timeout_seconds
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"server exited before health with code {process.returncode}\n{tail(server_log_path)}"
+                )
+            if healthy(base_url):
+                break
+            time.sleep(2)
+        else:
+            raise TimeoutError(
+                "server did not become healthy within "
+                f"{args.server_start_timeout_seconds:.0f}s\n{tail(server_log_path)}"
+            )
+        summary["server_ready_seconds"] = time.perf_counter() - server_started
+        atomic_json(summary_path, summary)
+
+        with client_log_path.open("wb") as client_log:
+            client = subprocess.run(
+                client_command,
+                cwd=repo_root,
+                env=env,
+                stdout=client_log,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        summary["profile_client_returncode"] = client.returncode
+        if client.returncode != 0:
+            raise RuntimeError(f"profile client failed with code {client.returncode}\n{tail(client_log_path)}")
+        profile_summary = json.loads((output_dir / "profile_summary.json").read_text())
+        if profile_summary.get("status") != "success":
+            raise RuntimeError(f"profile summary status is {profile_summary.get('status')!r}")
+        trace_files = sorted(trace_dir.glob("*.jsonl"))
+        if not trace_files or not any(path.stat().st_size for path in trace_files):
+            raise RuntimeError("execution trace contains no worker records")
+        summary["execution_trace_files"] = [str(path) for path in trace_files]
+        summary["status"] = "success"
+    except Exception as exc:
+        summary["error_type"] = type(exc).__name__
+        summary["error"] = str(exc)
+        caught = exc
+    finally:
+        if process is not None:
+            try:
+                summary["shutdown"] = stop_process_group(process, args.shutdown_timeout_seconds)
+            except Exception as exc:  # noqa: BLE001 - preserve primary error
+                summary["shutdown"] = {
+                    "method": "error",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+        server_log.close()
+        summary["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        summary["elapsed_seconds"] = (datetime.fromisoformat(summary["finished_utc"]) - started_utc).total_seconds()
+        summary["nvidia_smi_after"] = command_result(["nvidia-smi"], repo_root)
+        summary["server_log_tail"] = tail(server_log_path)
+        atomic_json(summary_path, summary)
+    if caught is not None:
+        raise caught
+    if summary.get("shutdown", {}).get("method") not in {
+        "sigterm",
+        "already_exited",
+    }:
+        summary["status"] = "failed_shutdown"
+        atomic_json(summary_path, summary)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

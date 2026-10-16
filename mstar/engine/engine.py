@@ -333,6 +333,16 @@ class ExecutingBatch:
     # Per-step wall-clock, for the worker's profiler
     exec_timings: ExecTimings = field(default_factory=ExecTimings)
 
+    # Optional diagnostic execution trace. Populated only when
+    # MSTAR_EXECUTION_TRACE_DIR is set by an experiment driver.
+    trace_batch_id: int | None = None
+    trace_scheduled_ns: int | None = None
+    trace_ready_ns: dict[int, int] = field(default_factory=dict)
+    trace_speculative: bool = False
+    trace_component_start_ns: int | None = None
+    trace_cuda_start_event: Any | None = None
+    trace_cuda_end_event: Any | None = None
+
     def __post_init__(self):
         self.per_request_info_wrapped = {
             rid: ForwardPassInfoWrapper(

@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AdmitRuntimeError
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime
+from mstar.profile.execution_trace import ExecutionTrace
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
     BatchBuilderType,
@@ -69,6 +70,11 @@ class ScheduledBatch:
     # ``ScheduleTPNode.spec_seq`` this batch came off the TP-follow FIFO with,
     # -1 otherwise. ``split_off_first`` / ``merge`` only ever see -1.
     tp_seq: int = -1
+    # Diagnostic trace metadata. These stay empty on normal serving runs.
+    trace_batch_id: int | None = None
+    trace_scheduled_ns: int | None = None
+    trace_ready_ns: dict[int, int] = field(default_factory=dict)
+    trace_speculative: bool = False
 
     def merge(self, other: "ScheduledBatch") -> None:
         """Fold ``other``'s requests in, ours first — they have waited longer."""
@@ -158,10 +164,13 @@ class MicroScheduler:
         parallel_leader_nodes: set[str] | None = None,
         max_consec_tp_follower_batches: int = 1,
         batch_builder_type: BatchBuilderType = BatchBuilderType.FIFO,
+        execution_trace: ExecutionTrace | None = None,
     ):
         self.engine_manager = engine_manager
         self.batch_builder = make_batch_builder(batch_builder_type)
         self.batch_number = 0
+        self.execution_trace = execution_trace
+        self._trace_ready_since: dict[tuple[int, str, str], int] = {}
         # The graph runtime, installed by the worker. Interning and the
         # (walk, node) -> worker graph index both live there.
         self.runtime: "GraphRuntime | None" = None
@@ -523,7 +532,39 @@ class MicroScheduler:
                 ready.setdefault((spec.node_name, spec.graph_walk), []).append(
                     ReadyNodeEntry(rid, wg_id, spec.graph_walk)
                 )
+        if self.execution_trace is not None and self.execution_trace.enabled:
+            observed_ns = time.perf_counter_ns()
+            for (node_name, graph_walk), entries in ready.items():
+                for entry in entries:
+                    key = (entry.request_id, node_name, graph_walk)
+                    if key in self._trace_ready_since:
+                        continue
+                    self._trace_ready_since[key] = observed_ns
+                    self.execution_trace.record(
+                        "scheduler_ready",
+                        request_handle=entry.request_id,
+                        node_name=node_name,
+                        graph_walk=graph_walk,
+                        ready_observed_ns=observed_ns,
+                    )
         return ready
+
+    def take_trace_ready_times(
+        self, node_name: str, graph_walk: str, request_ids: list[int],
+    ) -> dict[int, int]:
+        """Consume first-observed ready times for an actually submitted batch."""
+        if self.execution_trace is None or not self.execution_trace.enabled:
+            return {}
+        return {
+            rid: ready_ns
+            for rid in request_ids
+            if (
+                ready_ns := self._trace_ready_since.pop(
+                    (rid, node_name, graph_walk), None
+                )
+            )
+            is not None
+        }
 
     def _schedule_key(
         self, request_state: RequestStateManager,
@@ -965,4 +1006,3 @@ class MicroScheduler:
         admitted: there is no handle to clear anything else with, but a
         TP-follow batch may still be counted against the string."""
         self.pending_tp_follow_count.pop(rid_str, None)
-
