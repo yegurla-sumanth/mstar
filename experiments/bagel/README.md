@@ -95,8 +95,9 @@ and a four-panel plot.
 This is an explicitly bounded eager-path pilot: `TORCH_COMPILE_DISABLE=1` remains
 set because compiled dynamic branch pruning has not passed correctness. It also
 uses sequential B=1 requests, so it does not measure continuous batching. The
-notebook stores Hugging Face and `uv` caches on Drive so later fresh runtimes can
-reuse downloads; the first Step 5 run may still have to populate those caches.
+notebook stores the large Hugging Face cache on Drive so later fresh runtimes can
+reuse the checkpoint. The `uv` cache remains on local `/content` because Drive's
+FUSE filesystem does not reliably support its cache operations.
 
 The trace is enabled only when `MSTAR_EXECUTION_TRACE_DIR` is set by the
 profiling orchestrator. It does not add a synchronization beyond the worker's

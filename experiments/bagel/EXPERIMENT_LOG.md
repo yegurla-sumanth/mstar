@@ -398,8 +398,10 @@ reporting timing. It summarizes full-request and refinement-CUDA distributions,
 paired speedups and seconds saved, and request-window `nvidia-smi` samples.
 
 `notebooks/05_colab_bagel_cfg_branch_performance.ipynb` is pinned to that
-implementation revision. The notebook also moves the Hugging Face and `uv`
-caches to Drive for reuse across fresh Colab runtimes. Its first run remains
+implementation revision. The notebook persists the large Hugging Face cache on
+Drive for reuse across fresh Colab runtimes; the `uv` cache stays on local
+`/content` because Drive FUSE does not reliably support its cache operations.
+Its first run remains
 unmeasured locally: Python syntax, notebook JSON/code-cell compilation, the
 execution-trace unit tests, and Git whitespace checks pass; the BAGEL tests and
 full A100 experiment require the pinned CUDA environment. This experiment does
