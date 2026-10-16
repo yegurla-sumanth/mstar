@@ -75,3 +75,28 @@ activate that environment's `bin` directory on `PATH`. The repair adds
 `ninja` to the BAGEL dependencies, checks its executable during notebook
 setup, and prepends the active interpreter's directory to the server process
 `PATH`. The checkpoint cache can be reused for the retry.
+
+## 2026-10-16 — single-image retry succeeds
+
+### Measured result
+
+The retry reused the same Colab runtime and checkpoint cache after installing
+`ninja==1.11.1.4` and adding the virtual environment's `bin` directory to
+`PATH`. The executed repository revision remained
+`db48a7af83adba242dcc277fb89dae5f1a0806e5`; the durable setup repair is in the
+subsequent commit `61c43b47c63c6da623045e7a4a7709a93f8eaf05`.
+
+- Result directory:
+  `MyDrive/CMU_11868_BAGEL/smoke_20261016T043358Z/single_image_retry_ninja`
+- Server ready time: 494.224 seconds.
+- Client request boundary: 90.148 seconds.
+- Peak externally sampled device memory: 51,770 MiB.
+- Image SHA-256:
+  `d721d43943b6e13d8062cb91c30a9456805e38db9b81c244de57e5fccc8683f5`.
+- Shutdown: intentional `SIGTERM`, return code `-15`.
+
+The smoke client only returns success after receiving exactly one nonempty
+image and decoding it as a PNG with the requested dimensions. This satisfies
+the technical setup/correctness gate. A human visual-semantic check of the
+saved image remains separate. The server-ready and request times include cold
+loading and first-use compilation and are not warmed performance results.
