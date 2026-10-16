@@ -36,6 +36,20 @@ def _component_rows(root: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def command_stdout(payload: Any, field: str) -> str:
+    """Read a recorded command result, accepting the older plain-string form."""
+    if isinstance(payload, str) and payload:
+        return payload
+    if (
+        isinstance(payload, dict)
+        and payload.get("returncode") == 0
+        and isinstance(payload.get("stdout"), str)
+        and payload["stdout"]
+    ):
+        return payload["stdout"]
+    raise ValueError(f"Invalid recorded command result for {field}: {payload!r}")
+
+
 def trace_contract(
     root: Path,
     request_ids: list[str],
@@ -232,7 +246,10 @@ def _validated_runs(roots: dict[str, Path]) -> tuple[dict, dict, dict]:
     for name, expected in expected_staggers.items():
         if float(summaries[name]["workload"]["stagger_seconds"]) != expected:
             raise ValueError(f"Unexpected stagger for {name}")
-    heads = {run["repo"]["head"] for run in runs.values()}
+    heads = {
+        command_stdout(run["repo"]["head"], f"{name}.repo.head")
+        for name, run in runs.items()
+    }
     configs = {run["config"]["sha256"] for run in runs.values()}
     for name, run in runs.items():
         if run.get("status") != "success" or run.get("shutdown", {}).get("method") != "sigterm":
@@ -248,13 +265,13 @@ def _validated_runs(roots: dict[str, Path]) -> tuple[dict, dict, dict]:
     expected_indexes = set(range(int(serial_workload["measured_requests"])))
     if any(set(rows) != expected_indexes for rows in measured.values()):
         raise ValueError("Arms contain missing or mismatched measured request indexes")
-    return summaries, runs, measured
+    return summaries, runs, measured, next(iter(heads))
 
 
 def analyze(roots: dict[str, Path]) -> dict[str, Any]:
     from compare_batch_parity import compare_images
 
-    summaries, runs, measured = _validated_runs(roots)
+    summaries, runs, measured, code_revision = _validated_runs(roots)
     traces = {
         name: trace_contract(
             roots[name],
@@ -330,7 +347,7 @@ def analyze(roots: dict[str, Path]) -> dict[str, Any]:
         "performance_authorized": False,
         "hypothesis_assessment": assessment,
         "workload": summaries["serial_b1"]["workload"],
-        "code_revision": next(iter({run["repo"]["head"] for run in runs.values()})),
+        "code_revision": code_revision,
         "trace_contracts": trace_summaries,
         "latent_comparisons": comparisons,
         "image_comparisons": images,

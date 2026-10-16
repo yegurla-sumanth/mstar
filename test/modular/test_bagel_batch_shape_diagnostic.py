@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "experiments/bagel/scripts"))
 from analyze_batch_shape_diagnostic import (
     CAPTURE_STEPS,
     MIN_HOMOGENEOUS_BATCHES,
+    command_stdout,
     compare_trajectory,
     trace_contract,
 )
@@ -58,6 +59,18 @@ class BatchShapeDiagnosticTest(unittest.TestCase):
         (self.root / "execution_trace/worker.jsonl").write_text(
             "".join(json.dumps(row) + "\n" for row in rows)
         )
+
+    def test_recorded_git_head_is_extracted_from_command_result(self):
+        payload = {
+            "command": ["git", "rev-parse", "HEAD"],
+            "returncode": 0,
+            "stdout": "abc123",
+            "stderr": "",
+        }
+        self.assertEqual(command_stdout(payload, "repo.head"), "abc123")
+        self.assertEqual(command_stdout("legacy123", "repo.head"), "legacy123")
+        with self.assertRaisesRegex(ValueError, "repo.head"):
+            command_stdout({**payload, "returncode": 1}, "repo.head")
 
     def test_serial_contract(self):
         self.write([
