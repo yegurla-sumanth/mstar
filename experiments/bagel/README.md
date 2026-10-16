@@ -82,7 +82,7 @@ so its timings diagnose potential only. Repeated timing runs must disable latent
 capture and follow only after the numerical gate is reviewed.
 
 Step 5 is `notebooks/05_colab_bagel_cfg_branch_performance.ipynb`, pinned to
-implementation commit `b22e8bc2be7297e6cf636d369f442923c73a5d70`. It measures
+implementation commit `bca6661d197d87802da935097091f1f46ef433e8`. It measures
 only the exact `drop_image` optimization against `reference`: both shapes receive
 one warm-up, then five B=1 pairs run in alternating order with distinct paired
 seeds and no latent capture. Every pair must retain exact final PNG equality.
@@ -95,9 +95,10 @@ and a four-panel plot.
 This is an explicitly bounded eager-path pilot: `TORCH_COMPILE_DISABLE=1` remains
 set because compiled dynamic branch pruning has not passed correctness. It also
 uses sequential B=1 requests, so it does not measure continuous batching. The
-notebook stores the large Hugging Face cache on Drive so later fresh runtimes can
-reuse the checkpoint. The `uv` cache remains on local `/content` because Drive's
-FUSE filesystem does not reliably support its cache operations.
+Both the Hugging Face and `uv` working caches remain on local `/content` because
+Drive FUSE did not reliably serve the checkpoint's multi-gigabyte safetensors.
+Only experiment results persist on Drive. The checkpoint downloader validates
+every safetensors header before allowing the server to start.
 
 The trace is enabled only when `MSTAR_EXECUTION_TRACE_DIR` is set by the
 profiling orchestrator. It does not add a synchronization beyond the worker's

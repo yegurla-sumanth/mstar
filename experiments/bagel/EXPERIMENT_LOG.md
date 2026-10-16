@@ -397,13 +397,19 @@ refinement steps per request and verifies every observed branch schedule before
 reporting timing. It summarizes full-request and refinement-CUDA distributions,
 paired speedups and seconds saved, and request-window `nvidia-smi` samples.
 
-`notebooks/05_colab_bagel_cfg_branch_performance.ipynb` is pinned to that
-implementation revision. The notebook persists the large Hugging Face cache on
-Drive for reuse across fresh Colab runtimes; the `uv` cache stays on local
-`/content` because Drive FUSE does not reliably support its cache operations.
-Its first run remains
+`notebooks/05_colab_bagel_cfg_branch_performance.ipynb` was initially pinned to
+that implementation revision. Its first run remains
 unmeasured locally: Python syntax, notebook JSON/code-cell compilation, the
 execution-trace unit tests, and Git whitespace checks pass; the BAGEL tests and
 full A100 experiment require the pinned CUDA environment. This experiment does
 not repair or evaluate compiled pruning and does not combine the optimization
 with heterogeneous continuous batching.
+
+The first Step 5 A100 attempt started no measured requests. The worker failed
+during weight loading with `SafetensorError: header too large` while reading the
+Hugging Face cache placed on Google Drive FUSE. This was a cache-placement error,
+not a model, benchmark, or GPU execution failure. Revision
+`bca6661d197d87802da935097091f1f46ef433e8` keeps both working caches on local
+`/content` and makes the checkpoint downloader open every safetensors header
+before server startup. Results alone persist on Drive. The notebook is repinned
+to this revision; the failed directory is preserved as failure evidence.
