@@ -40,11 +40,13 @@ After the smoke gate succeeds, run
 request, then submits six measured requests eight seconds apart. The opt-in
 worker trace records scheduler-ready, scheduled, component-start, and
 component-complete events, including CUDA-event durations. The notebook saves
-and displays three aligned plots:
+and displays four plots:
 
 - per-request component and ready-to-scheduled timelines;
 - M* component lanes with service windows and CUDA activity;
-- externally sampled GPU utilization and total device-memory use.
+- externally sampled GPU utilization and total device-memory use;
+- refinement CUDA time by scheduler group size beside per-request prompt and
+  VAE ready waits, separating true model batching from scheduler grouping.
 
 The trace is enabled only when `MSTAR_EXECUTION_TRACE_DIR` is set by the
 profiling orchestrator. It does not add a synchronization beyond the worker's

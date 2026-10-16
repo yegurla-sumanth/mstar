@@ -151,3 +151,94 @@ and FlashInfer 0.6.14 were healthy. Colab had exported
 serving environment, which does not include the notebook-only backend. The
 plotting script and preflight now force Matplotlib's noninteractive `Agg`
 backend before import; no serving dependency or GPU repair was required.
+
+## 2026-10-16 — clean six-request staggered trace
+
+### Provenance and validity
+
+The first profiling invocation was discarded because a restarted notebook
+cell left its original server alive on port 8000. The clean rerun used a new
+output directory and port 8017 after verifying that the old process group was
+gone. Its source revision was
+`88f34273a71d9600707b6d65b5664a59d4d69a44`; the later plotting-backend fix
+does not change serving behavior.
+
+- Archived result: `staggered_6_clean_20261016T055925Z.zip`
+- Archive SHA-256:
+  `8477c0f82328c41f15e7848da0cf7c1d284b525ad279393a69c2bf518ae00a53`
+- Hardware: one NVIDIA A100-SXM4-80GB.
+- Server ready: 88.061 seconds with cached checkpoint artifacts.
+- One warm-up, then six measured requests arriving eight seconds apart.
+- Request latencies: 158.015, 203.426, 214.657, 218.403, 214.694, and
+  207.153 seconds.
+- First measured submission to last completion: 247.143 seconds.
+- Shutdown: intentional `SIGTERM`, return code `-15`.
+
+All six requests completed the expected one prompt prefill, 49 LLM refinement
+steps, and one VAE decode. The trace contains 89 measured scheduler component
+completions representing 306 logical request-component memberships. The plots
+completed without trace-validation warnings.
+
+### What the trace shows
+
+Externally sampled GPU utilization averaged 98.99% during the measured window;
+95.42% of its 240 one-second samples were at least 95%. Device memory remained
+between 51,382 and 51,390 MiB. This is coarse `nvidia-smi` evidence, not proof
+that every SM or execution resource was saturated.
+
+Recorded component CUDA durations totaled 245.941 seconds:
+
+- LLM refinement: 244.448 seconds (99.39%).
+- Prompt prefill: 0.968 seconds (0.39%).
+- VAE decode: 0.526 seconds (0.21%).
+
+The completion-anchored CUDA intervals were effectively back-to-back: 0.320
+seconds of positive gap and 0.007 seconds of apparent overlap, the latter small
+enough to be timestamp-anchoring noise. This run therefore provides no evidence
+of useful component overlap in the current single-worker path. Even ideal,
+zero-contention overlap of every measured VAE decode could hide at most its
+0.526 seconds of device work, about 0.21% of this workload's makespan. VAE
+overlap is not the leading throughput experiment for this configuration.
+
+The stronger scheduling signal is execution granularity. BAGEL's LLM submodule
+only declares `decode`, `prefill_text`, and `prefill_vit` batchable; `image_gen`
+is excluded. When the scheduler groups multiple unbatchable refinement rows,
+the engine uses `_exec_per_request` and executes their full cycles in order
+before yielding. The measured group medians follow that implementation almost
+perfectly:
+
+| Scheduler group size | Batches | Median refinement CUDA time |
+|---:|---:|---:|
+| 1 | 14 | 0.827 s |
+| 2 | 9 | 1.655 s |
+| 3 | 10 | 2.495 s |
+| 4 | 9 | 3.326 s |
+| 5 | 14 | 4.160 s |
+| 6 | 21 | 4.989 s |
+
+Thus a scheduler group of six is not one efficient six-request model forward;
+it is approximately six serial 0.83-second forwards forming a nearly
+five-second non-preemptive scheduling quantum. Short ready work waits behind
+that quantum. Prompt-prefill ready waits across R0–R5 were 0.000, 0.820, 1.647,
+2.473, 3.338, and 3.304 seconds. VAE-decode ready waits were 4.157, 3.324,
+2.489, 1.659, 0.827, and 0.005 seconds. Scheduled-to-component-start delay was
+otherwise only a few milliseconds, locating the delay in scheduler selection
+rather than post-selection dispatch.
+
+### Decision and next experiment
+
+Do not implement CUDA-stream overlap next. First isolate the lower-risk
+scheduler question: compare the current unbounded scheduler grouping with an
+otherwise identical arm that caps `LLM/image_gen` scheduler groups at one.
+That arm lets the scheduler reconsider ready prefills and decodes after every
+roughly 0.83-second refinement row, without changing the model, request work,
+or component priority. If the cap reduces request latency without materially
+hurting makespan, a later experiment can separately add boundary-component
+priority; do not combine both changes initially.
+
+Use the same frozen six-request arrival trace for at least five paired warmed
+repeats, alternate arm order, and keep one loaded server per arm so startup is
+outside the comparison. Report request latency, first/last completion,
+makespan, ready waits, actual group sizes, total CUDA work, and correctness.
+The present single diagnostic run motivates that comparison but is not itself
+a performance claim.

@@ -6,7 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from collections import Counter
+import statistics
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
@@ -241,6 +242,128 @@ def main() -> int:
     fig.savefig(telemetry_plot, dpi=180)
     plt.close(fig)
 
+    # The image-generation walk is scheduler-grouped but cannot execute as one
+    # model batch (LLMSubmodule.can_batch excludes image_gen). Show whether its
+    # device time scales with the number of grouped requests, alongside the two
+    # complete ready-wait series that occur once per request.
+    refinement_cuda_by_batch_size = defaultdict(list)
+    for row in components:
+        if component_label(row) != "LLM refinement":
+            continue
+        cuda_ms = row.get("cuda_duration_ms")
+        if cuda_ms is not None:
+            refinement_cuda_by_batch_size[int(row.get("batch_size", 1))].append(
+                cuda_ms / 1000
+            )
+
+    wait_by_request = {
+        request_id: {"Prompt prefill": [], "VAE decode": []}
+        for request_id in measured_ids
+    }
+    for row in scheduled:
+        label = component_label(row)
+        if label not in ("Prompt prefill", "VAE decode"):
+            continue
+        ready_wait_ms = row.get("ready_wait_ms", {})
+        for request_id, handle in zip(
+            row.get("request_ids", []), row.get("request_handles", []), strict=False
+        ):
+            value = ready_wait_ms.get(str(handle))
+            if request_id in measured_ids and value is not None:
+                wait_by_request[request_id][label].append(value / 1000)
+
+    diagnostic_plot = None
+    if refinement_cuda_by_batch_size:
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5.2))
+
+        batch_sizes = sorted(refinement_cuda_by_batch_size)
+        medians = [
+            statistics.median(refinement_cuda_by_batch_size[size])
+            for size in batch_sizes
+        ]
+        for size in batch_sizes:
+            values = refinement_cuda_by_batch_size[size]
+            axes[0].scatter(
+                [size] * len(values),
+                values,
+                color=colors["LLM refinement"],
+                alpha=0.28,
+                s=24,
+                edgecolors="none",
+            )
+        axes[0].plot(
+            batch_sizes,
+            medians,
+            color=colors["LLM refinement"],
+            marker="o",
+            linewidth=2,
+            label="Observed median",
+        )
+        if 1 in refinement_cuda_by_batch_size:
+            single_median = statistics.median(refinement_cuda_by_batch_size[1])
+            axes[0].plot(
+                batch_sizes,
+                [single_median * size for size in batch_sizes],
+                color="#555555",
+                linestyle="--",
+                linewidth=1.4,
+                label="B × median(B=1)",
+            )
+        for size, median in zip(batch_sizes, medians, strict=True):
+            axes[0].annotate(
+                f"n={len(refinement_cuda_by_batch_size[size])}",
+                (size, median),
+                xytext=(0, 8),
+                textcoords="offset points",
+                ha="center",
+                fontsize=8,
+            )
+        axes[0].set_xlabel("Scheduler group size B")
+        axes[0].set_ylabel("CUDA duration per scheduler group (seconds)")
+        axes[0].set_title("LLM refinement group cost")
+        axes[0].set_xticks(batch_sizes)
+        axes[0].grid(alpha=0.2)
+        axes[0].legend(fontsize=9)
+
+        ordered_requests = sorted(measured, key=lambda row: row["request_index"])
+        x_positions = list(range(len(ordered_requests)))
+        width = 0.36
+        prefill_waits = []
+        vae_waits = []
+        for request in ordered_requests:
+            waits = wait_by_request[request["request_id"]]
+            prefill_waits.append(sum(waits["Prompt prefill"]))
+            vae_waits.append(sum(waits["VAE decode"]))
+        axes[1].bar(
+            [x - width / 2 for x in x_positions],
+            prefill_waits,
+            width,
+            color=colors["Prompt prefill"],
+            label="Prompt prefill",
+        )
+        axes[1].bar(
+            [x + width / 2 for x in x_positions],
+            vae_waits,
+            width,
+            color=colors["VAE decode"],
+            label="VAE decode",
+        )
+        axes[1].set_xticks(
+            x_positions,
+            [f"R{request['request_index']}" for request in ordered_requests],
+        )
+        axes[1].set_xlabel("Request")
+        axes[1].set_ylabel("Ready-to-scheduled wait (seconds)")
+        axes[1].set_title("Wait before short boundary components")
+        axes[1].grid(axis="y", alpha=0.2)
+        axes[1].legend(fontsize=9)
+
+        fig.suptitle("Scheduler grouping cost and request-boundary waiting")
+        fig.tight_layout()
+        diagnostic_plot = output_dir / "scheduler_grouping_diagnostics.png"
+        fig.savefig(diagnostic_plot, dpi=180)
+        plt.close(fig)
+
     per_request_counts = {}
     warnings = []
     expected = {
@@ -256,15 +379,111 @@ def main() -> int:
         per_request_counts[request_id] = dict(sorted(counts.items()))
         for key, expected_count in expected.items():
             if counts[key] != expected_count:
-                warnings.append(f"{request_id}: expected {expected_count} {key} executions, traced {counts[key]}")
+                warnings.append(
+                    f"{request_id}: expected {expected_count} {key} executions, "
+                    f"traced {counts[key]}"
+                )
+        for label in ("Prompt prefill", "VAE decode"):
+            observed = len(wait_by_request[request_id][label])
+            if observed != 1:
+                warnings.append(
+                    f"{request_id}: expected one ready wait for {label}, traced {observed}"
+                )
 
+    refinement_batch_stats = {
+        str(size): {
+            "batch_count": len(values),
+            "median_cuda_seconds": statistics.median(values),
+            "total_cuda_seconds": sum(values),
+        }
+        for size, values in sorted(refinement_cuda_by_batch_size.items())
+    }
+    complete_waits = {
+        label: [
+            sum(wait_by_request[request["request_id"]][label])
+            for request in sorted(measured, key=lambda row: row["request_index"])
+        ]
+        for label in ("Prompt prefill", "VAE decode")
+    }
+    cuda_seconds_by_component = defaultdict(float)
+    cuda_intervals = []
+    logical_component_memberships = 0
+    for row in components:
+        cuda_ms = row.get("cuda_duration_ms")
+        if cuda_ms is None:
+            continue
+        duration_ns = cuda_ms * 1e6
+        end_ns = row["gpu_complete_ns"]
+        cuda_seconds_by_component[component_label(row)] += cuda_ms / 1000
+        cuda_intervals.append((end_ns - duration_ns, end_ns))
+        logical_component_memberships += len(measured_ids.intersection(row.get("request_ids", [])))
+    cuda_intervals.sort()
+    positive_gap_ns = 0.0
+    apparent_overlap_ns = 0.0
+    for previous, current in zip(cuda_intervals, cuda_intervals[1:], strict=False):
+        delta_ns = current[0] - previous[1]
+        if delta_ns >= 0:
+            positive_gap_ns += delta_ns
+        else:
+            apparent_overlap_ns -= delta_ns
+
+    measurement_seconds = (
+        summary["measurement_finished_perf_ns"] - summary["measurement_start_perf_ns"]
+    ) / 1e9
+    measured_gpu_samples = [
+        row
+        for row in valid_samples
+        if 0 <= (row["sample_time_ns"] - t0_wall) / 1e9 <= measurement_seconds
+    ]
+    if not measured_gpu_samples:
+        raise RuntimeError("gpu_samples.json has no samples inside the measured window")
+    utilization = [row["utilization_gpu_percent"] for row in measured_gpu_samples]
+    memory_mib = [row["memory_used_mib"] for row in measured_gpu_samples]
+    request_latencies = [row["client_elapsed_seconds"] for row in measured]
+    request_makespan_seconds = (
+        max(row["complete_perf_ns"] for row in measured)
+        - min(row["submit_perf_ns"] for row in measured)
+    ) / 1e9
+    total_cuda_seconds = sum(cuda_seconds_by_component.values())
+    measured_metrics = {
+        "request_latencies_seconds": request_latencies,
+        "request_makespan_seconds": request_makespan_seconds,
+        "component_cuda_seconds": dict(sorted(cuda_seconds_by_component.items())),
+        "component_cuda_share": {
+            label: seconds / total_cuda_seconds
+            for label, seconds in sorted(cuda_seconds_by_component.items())
+        },
+        "total_component_cuda_seconds": total_cuda_seconds,
+        "estimated_cuda_positive_gap_seconds": positive_gap_ns / 1e9,
+        "estimated_cuda_apparent_overlap_seconds": apparent_overlap_ns / 1e9,
+        "logical_component_memberships": logical_component_memberships,
+        "average_memberships_per_component_batch": (
+            logical_component_memberships / len(components)
+        ),
+        "gpu_sample_count_during_measurement": len(measured_gpu_samples),
+        "gpu_utilization_mean_percent": statistics.mean(utilization),
+        "gpu_utilization_median_percent": statistics.median(utilization),
+        "gpu_utilization_samples_at_least_95_percent_fraction": (
+            sum(value >= 95 for value in utilization) / len(utilization)
+        ),
+        "gpu_memory_peak_mib": max(memory_mib),
+        "gpu_memory_min_mib": min(memory_mib),
+    }
+    plot_paths = [request_plot, scheduler_plot, telemetry_plot]
+    if diagnostic_plot is not None:
+        plot_paths.append(diagnostic_plot)
     manifest = {
         "status": "complete" if not warnings else "complete_with_warnings",
         "input_dir": str(input_dir),
-        "plots": [str(request_plot), str(scheduler_plot), str(telemetry_plot)],
+        "plots": [str(path) for path in plot_paths],
         "measured_request_count": len(measured),
         "component_completion_count": len(components),
-        "scheduler_ready_batch_count": sum(1 for row in scheduled if row.get("ready_observed_ns")),
+        "scheduler_ready_batch_count": sum(
+            1 for row in scheduled if row.get("ready_observed_ns")
+        ),
+        "refinement_cuda_by_scheduler_group_size": refinement_batch_stats,
+        "complete_ready_wait_seconds_by_request": complete_waits,
+        "measured_metrics": measured_metrics,
         "per_request_component_counts": per_request_counts,
         "expected_per_request_component_counts": expected,
         "warnings": warnings,
