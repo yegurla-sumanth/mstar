@@ -262,20 +262,26 @@ class BagelModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        checkpoint_revision: str | None = None,
         **kwargs
     ):
         self.cache_dir = cache_dir
+        self.checkpoint_revision = checkpoint_revision
 
         config_path = hf_hub_download(
             repo_id=model_path_hf, filename="config.json",
-            revision=None, cache_dir=cache_dir,
+            revision=checkpoint_revision, cache_dir=cache_dir,
         )
         with open(config_path) as f:
             self.config = load_bagel_config(json.load(f))
 
         self.model_path_hf = model_path_hf
 
-        self.tokenizer = BagelTokenizer.from_pretrained(model_path_hf, cache_dir=cache_dir)
+        self.tokenizer = BagelTokenizer.from_pretrained(
+            model_path_hf,
+            cache_dir=cache_dir,
+            revision=checkpoint_revision,
+        )
         self.tokenizer, new_token_ids, _ = add_special_tokens(self.tokenizer)
 
         # Special token IDs
@@ -320,7 +326,9 @@ class BagelModel(Model):
         if self.repo is not None:
             return
         local_dir = snapshot_download(
-            repo_id=self.model_path_hf, cache_dir=self.cache_dir,
+            repo_id=self.model_path_hf,
+            cache_dir=self.cache_dir,
+            revision=self.checkpoint_revision,
         )
         self.repo = Path(local_dir)
 
@@ -768,7 +776,9 @@ class BagelModel(Model):
 
     def checkpoint_path(self) -> str:
         return snapshot_download(
-            repo_id=self.model_path_hf, cache_dir=self.cache_dir,
+            repo_id=self.model_path_hf,
+            cache_dir=self.cache_dir,
+            revision=self.checkpoint_revision,
         )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:

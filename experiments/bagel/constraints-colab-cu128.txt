@@ -1,0 +1,8 @@
+# Candidate stack for the first Colab A100 smoke. Freeze the complete resolved
+# environment only after this stack completes a real BAGEL image generation.
+torch==2.9.1
+torchvision==0.24.1
+torchaudio==2.9.1
+flashinfer-python==0.6.14
+ninja==1.11.1.4
+torchcodec==0.9.1

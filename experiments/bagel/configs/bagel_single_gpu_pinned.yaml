@@ -1,0 +1,24 @@
+model: "bagel"
+max_seq_len: 32768
+
+# The upstream loader otherwise follows the mutable Hugging Face default branch.
+# This commit was the repository HEAD observed on 2026-10-16.
+model_kwargs:
+  checkpoint_revision: "5019f57d168e5816e8f3f701b17cc816bb7cf24b"
+
+node_groups:
+  - node_names:
+      - vit_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_encoder
+      - vae_decoder
+    ranks:
+      - 0
+
+  - node_names:
+      - LLM
+    ranks:
+      - 0
