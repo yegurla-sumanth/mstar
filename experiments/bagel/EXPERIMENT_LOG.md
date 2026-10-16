@@ -353,3 +353,26 @@ not from dropping the algebraically inactive image-guidance row. Diagnostic
 client times were 40.726 seconds for `late_main` and 28.853 seconds for
 `auto`; neither is a performance result because selected-step latent capture
 synchronizes execution and compilation was disabled.
+
+The downloaded archive confirms that `drop_image` is bit-identical at every
+captured post-step boundary (0, 20, 40, 41, and 48). Both `late_main` and
+`auto` are exact through step 40, first diverge at step 41 with relative L2
+error 0.001000, and reach 0.004892 at step 48. Their final image has PSNR
+51.522 dB, mean absolute pixel error 0.209, maximum pixel error 76, and 83.44%
+exactly equal channel values relative to `reference`.
+
+Trace-derived refinement CUDA totals were 44.345 seconds for `reference`,
+30.182 for `drop_image`, 39.838 for `late_main`, and 27.974 for `auto`. Typical
+per-step CUDA time was approximately 902--905 ms for three CFG rows, 613--617
+ms for two rows, and 324--328 ms for one row. Sampled GPU utilization had a
+100% median, while peak sampled device memory was 55,698 MiB in every measured
+policy window. Branch pruning therefore removes substantial transformer work
+but does not reduce this runtime's sampled peak allocation.
+
+These are still one-prompt, one-seed, one-repeat eager diagnostics with
+selected-step synchronization. The execution trace proves 49 image-generation
+completions per arm and their loop indices, but does not yet record active CFG
+labels directly; the virtual-row count is derived from the tested policy and
+implementation. A reportable performance run needs direct active-row trace
+metadata, no latent dumping, multiple paired repeats, and either a repaired
+compiled path or an explicitly bounded eager-only claim.
