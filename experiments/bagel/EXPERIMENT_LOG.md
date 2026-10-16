@@ -332,3 +332,24 @@ recorded by the client summary, and adds a regression test for the resulting
 path. The Step 4 notebook is pinned to this revision for the reduced latent
 correctness rerun. The five policy images and traces from the completed retry
 remain valid; only cross-policy intermediate-latent comparisons are missing.
+
+The corrected reduced gate at revision
+`eb7327801785202639cdbdb9d63e5dad265f3290` completed `reference`,
+`drop_image`, `late_main`, and `auto` on the same A100 run. `drop_image` was
+exactly equal to `reference`: maximum captured-latent relative L2 error was
+zero, final-image PSNR was infinite, and the PNG SHA-256 hashes matched. It
+reduced expected virtual refinement rows from 147 to 98. Its synchronized
+eager diagnostic client time was 31.059 seconds versus 45.233 seconds for the
+reference (31.3% lower), which is evidence of performance potential rather
+than a reportable speedup.
+
+`late_main` reduced expected rows from 147 to 131 but was not numerically
+exact: maximum captured-latent relative L2 error was 0.004892 and final-image
+PSNR was 51.522 dB. `auto` produced exactly the same final PNG as `late_main`
+and reported the same maximum latent error relative to `reference`, while
+reducing expected rows further to 90. This decomposition shows that the
+observed drift comes from the late transition to a one-row main-only forward,
+not from dropping the algebraically inactive image-guidance row. Diagnostic
+client times were 40.726 seconds for `late_main` and 28.853 seconds for
+`auto`; neither is a performance result because selected-step latent capture
+synchronizes execution and compilation was disabled.
