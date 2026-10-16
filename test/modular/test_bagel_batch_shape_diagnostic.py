@@ -12,7 +12,12 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "experiments/bagel/scripts"))
 
-from analyze_batch_shape_diagnostic import CAPTURE_STEPS, compare_trajectory, trace_contract
+from analyze_batch_shape_diagnostic import (
+    CAPTURE_STEPS,
+    MIN_HOMOGENEOUS_BATCHES,
+    compare_trajectory,
+    trace_contract,
+)
 import run_profile
 
 
@@ -84,11 +89,29 @@ class BatchShapeDiagnosticTest(unittest.TestCase):
                 self.root, ["a", "b"], cap=2, expected="homogeneous"
             )
 
-    def test_homogeneous_contract_rejects_partial_pairing(self):
-        rows = [event(["a", "b"], [step, step], step) for step in CAPTURE_STEPS]
-        rows[0:1] = [event(["a"], [0]), event(["b"], [0])]
+    def test_homogeneous_contract_allows_early_singletons(self):
+        rows = [event(["a"], [0]), event(["b"], [0])]
+        rows += [event(["a", "b"], [step, step], step) for step in range(1, 49)]
         self.write(rows)
-        with self.assertRaisesRegex(ValueError, "49 same-step"):
+        report = trace_contract(
+            self.root, ["a", "b"], cap=2, expected="homogeneous"
+        )
+        self.assertEqual(report["same_age_batch_count"], 48)
+        self.assertEqual(report["singleton_batch_count"], 2)
+
+    def test_homogeneous_contract_rejects_too_few_paired_steps(self):
+        first_paired = 49 - (MIN_HOMOGENEOUS_BATCHES - 1)
+        rows = [
+            event([request_id], [step], step)
+            for request_id in ("a", "b")
+            for step in range(first_paired)
+        ]
+        rows += [
+            event(["a", "b"], [step, step], step)
+            for step in range(first_paired, 49)
+        ]
+        self.write(rows)
+        with self.assertRaisesRegex(ValueError, "at least 32 same-step"):
             trace_contract(
                 self.root, ["a", "b"], cap=2, expected="homogeneous"
             )

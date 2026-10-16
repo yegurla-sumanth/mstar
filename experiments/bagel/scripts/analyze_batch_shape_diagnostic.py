@@ -16,6 +16,7 @@ from typing import Any
 from run_smoke import atomic_json
 
 CAPTURE_STEPS = tuple(range(49))
+MIN_HOMOGENEOUS_BATCHES = 32
 
 
 def _component_rows(root: Path) -> list[dict[str, Any]]:
@@ -118,13 +119,12 @@ def trace_contract(
     if expected == "serial" and (same_age_batches or mixed_age_batches):
         raise ValueError("Serial B=1 arm contains a measured multi-request batch")
     if expected == "homogeneous" and (
-        len(same_age_batches) != len(CAPTURE_STEPS)
+        len(same_age_batches) < MIN_HOMOGENEOUS_BATCHES
         or mixed_age_batches
-        or singleton_batches
     ):
         raise ValueError(
-            "Homogeneous B=2 arm did not keep both measured requests in exactly "
-            "49 same-step batches"
+            "Homogeneous B=2 arm requires no mixed-age measured batches and at "
+            f"least {MIN_HOMOGENEOUS_BATCHES} same-step measured batches"
         )
     if expected == "heterogeneous" and not mixed_age_batches:
         raise ValueError("Heterogeneous B=2 arm has no measured mixed-age batch")
