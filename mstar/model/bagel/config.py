@@ -63,6 +63,7 @@ class BagelModelConfig:
     cfg_interval: tuple[float, float] = (0.4, 1.0)
     cfg_renorm_type: str = "global"
     cfg_renorm_min: float = 0.0
+    cfg_branch_policy: str = "reference"
     think_mode: bool = False
 
     # Sampling defaults (per-request overridable via model_kwargs)

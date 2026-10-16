@@ -5,8 +5,10 @@
 
 import logging
 import os
+import re
 from collections.abc import Mapping
-from typing import Any
+from pathlib import Path
+from typing import Any, NamedTuple
 
 import torch
 from torch import nn
@@ -24,8 +26,11 @@ from mstar.engine.cuda_graph_config import (
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.bagel.batching import (
+    CFG_BRANCH_ORDER,
+    cfg_branch_labels_for_step,
     collate_image_gen_inputs,
     combine_cfg_velocities,
+    combine_pruned_cfg_velocities,
     split_image_gen_outputs,
 )
 from mstar.model.bagel.components.language_model import BagelForCausalLM
@@ -74,6 +79,13 @@ NODE_TO_CFG_LABEL = {
 VIT_BLOCK_LOOP = "vit_block_loop"
 
 
+class CFGStepInfo(NamedTuple):
+    """Per-row guidance state needed to declare the physical CFG plan."""
+
+    requires_cfg: bool
+    active_labels: tuple[str, ...]
+
+
 def requires_cfg_for_inputs(inputs: list) -> bool:
     """Whether this batch runs the guidance branches, read off the rows.
 
@@ -81,7 +93,33 @@ def requires_cfg_for_inputs(inputs: list) -> bool:
     it too, so this answers for a replay and for the capture that recorded it —
     which the per-request info cannot (capture passes `dummy_metadata`).
     """
-    return any(bool(inp.resource_step_info) for inp in inputs)
+    return any(
+        (
+            inp.resource_step_info.requires_cfg
+            if isinstance(inp.resource_step_info, CFGStepInfo)
+            else bool(inp.resource_step_info)
+        )
+        for inp in inputs
+    )
+
+
+def image_cfg_labels_for_inputs(inputs: list) -> tuple[str, ...]:
+    """Return the one active CFG signature shared by an image-step batch."""
+    signatures = {
+        (
+            inp.resource_step_info.active_labels
+            if isinstance(inp.resource_step_info, CFGStepInfo)
+            else CFG_BRANCH_ORDER
+            if bool(inp.resource_step_info)
+            else ("main",)
+        )
+        for inp in inputs
+    }
+    if len(signatures) != 1:
+        raise ValueError(
+            "BAGEL image batch mixed incompatible active CFG branch sets"
+        )
+    return next(iter(signatures))
 
 
 def active_labels(graph_walk: str, cfg: bool, node_name: str) -> list[str]:
@@ -837,9 +875,8 @@ class LLMSubmodule(ARNodeSubmodule):
         # What `declare_step` needs but cannot see: whether this request runs
         # the guidance branches. It is per-request, so it travels with the
         # request's inputs rather than being read off the batch later.
-        node_inputs.resource_step_info = fwd_info.step_metadata.get(
-            "requires_cfg", False
-        )
+        requires_cfg = fwd_info.step_metadata.get("requires_cfg", False)
+        node_inputs.resource_step_info = requires_cfg
 
         if graph_walk == "prefill_text":
             node_inputs.input_ids = inputs["text_inputs"][0]
@@ -890,6 +927,31 @@ class LLMSubmodule(ARNodeSubmodule):
                 )
             )
             labels = ["main", "cfg_text", "cfg_img"]
+            if graph_walk == "image_gen":
+                labels = list(cfg_branch_labels_for_step(
+                    fwd_info.dynamic_loop_iter_counts.get(
+                        "image_gen_loop", 0
+                    ),
+                    requires_cfg=requires_cfg,
+                    policy=fwd_info.step_metadata.get(
+                        "cfg_branch_policy", self.config.cfg_branch_policy
+                    ),
+                    num_timesteps=self.config.num_timesteps,
+                    timestep_shift=self.config.timestep_shift,
+                    cfg_text_scale=fwd_info.step_metadata.get(
+                        "cfg_text_scale", self.config.cfg_text_scale
+                    ),
+                    cfg_img_scale=fwd_info.step_metadata.get(
+                        "cfg_img_scale", self.config.cfg_img_scale
+                    ),
+                    cfg_interval=fwd_info.step_metadata.get(
+                        "cfg_interval", self.config.cfg_interval
+                    ),
+                ))
+                node_inputs.resource_step_info = CFGStepInfo(
+                    requires_cfg=requires_cfg,
+                    active_labels=tuple(labels),
+                )
             seq_len = tensor_inputs["empty_combined_emb"].shape[0]
             node_inputs.input_seq_len = seq_len
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
@@ -921,7 +983,11 @@ class LLMSubmodule(ARNodeSubmodule):
         being read off the batch here.
         """
         requires_cfg = requires_cfg_for_inputs(inputs)
-        labels = self._get_active_labels(graph_walk, requires_cfg)
+        labels = (
+            list(image_cfg_labels_for_inputs(inputs))
+            if graph_walk == "image_gen"
+            else self._get_active_labels(graph_walk, requires_cfg)
+        )
         spans = tuple(inp.input_seq_len for inp in inputs)
 
         # Label-major, matching how a combined plan concatenates its sources;
@@ -938,7 +1004,7 @@ class LLMSubmodule(ARNodeSubmodule):
             ] for label in labels
         }
 
-        if graph_walk == "image_gen" and requires_cfg:
+        if graph_walk == "image_gen" and requires_cfg and len(labels) > 1:
             # Batched CFG: one combined plan across all three labels so
             # image_gen runs one forward instead of three. The frozen caches
             # never grow during flow matching, so nothing commits.
@@ -1049,6 +1115,7 @@ class LLMSubmodule(ARNodeSubmodule):
         declaration the runner drives before this runs."""
         if graph_walk == "image_gen":
             result = collate_image_gen_inputs(inputs)
+            result["cfg_active_labels"] = image_cfg_labels_for_inputs(inputs)
         else:
             if graph_walk == "image_gen_cfg":
                 assert len(inputs) == 1, (
@@ -1085,7 +1152,11 @@ class LLMSubmodule(ARNodeSubmodule):
         if graph_walk == "prefill_vae":
             return self._forward_prefill_vae(**kwargs)
         elif graph_walk == "image_gen":
-            return self._forward_image_gen(**kwargs)
+            out = self._forward_image_gen(**kwargs)
+            self._maybe_dump_image_latents(
+                engine_inputs.request_ids[0], request_info, out
+            )
+            return out
         elif graph_walk == "image_gen_cfg":
             return self._forward_image_gen_single_branch(**kwargs)
 
@@ -1103,6 +1174,52 @@ class LLMSubmodule(ARNodeSubmodule):
         if _LOGITS in out:
             return self._sample_one(engine_inputs.request_ids, out.pop(_LOGITS)[0])
         return out
+
+    @staticmethod
+    def _maybe_dump_image_latents(
+        request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: NameToTensorList,
+    ) -> None:
+        """Save selected post-step latents for an opt-in correctness run.
+
+        This synchronizes device state and is therefore deliberately disabled
+        unless ``MSTAR_BAGEL_DEBUG_LATENT_DIR`` is set. Never enable it for a
+        performance measurement.
+        """
+        root = os.environ.get("MSTAR_BAGEL_DEBUG_LATENT_DIR")
+        if not root:
+            return
+        step = request_info.dynamic_loop_iter_counts.get(
+            "image_gen_loop", 0
+        )
+        selected = {
+            int(value)
+            for value in os.environ.get(
+                "MSTAR_BAGEL_DEBUG_LATENT_STEPS", "0,20,40,41,48"
+            ).split(",")
+            if value.strip()
+        }
+        if step not in selected:
+            return
+        safe_request_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(request_id))
+        request_dir = Path(root) / safe_request_id
+        request_dir.mkdir(parents=True, exist_ok=True)
+        path = request_dir / f"after_step_{step:02d}.pt"
+        temporary = path.with_suffix(".tmp")
+        torch.save(
+            {
+                "request_id": str(request_id),
+                "step_index": step,
+                "cfg_branch_policy": request_info.step_metadata.get(
+                    "cfg_branch_policy", "reference"
+                ),
+                "latents": outputs["latents"][0].detach().cpu(),
+                "time_index": outputs["time_index"][0].detach().cpu(),
+            },
+            temporary,
+        )
+        os.replace(temporary, path)
 
     def _forward_prefill_text(
         self, input_ids: torch.Tensor,
@@ -1259,6 +1376,7 @@ class LLMSubmodule(ARNodeSubmodule):
         text_mask: torch.Tensor,
         time_index: torch.Tensor,
         requires_cfg: bool = True,
+        cfg_active_labels: tuple[str, ...] | list[str] | None = None,
         **kwargs,
     ) -> NameToTensorList:
         """Flow matching Euler step with optional 3-pass CFG.
@@ -1322,68 +1440,78 @@ class LLMSubmodule(ARNodeSubmodule):
         empty_combined_emb[vae_token_indexes] = latents_
         logger.debug("packed_seq = %s", empty_combined_emb)  # tensor repr: keep lazy
 
-        if requires_cfg:
-            cfg_text_scale = kwargs.pop("cfg_text_scale", self.config.cfg_text_scale)
-            cfg_img_scale = kwargs.pop("cfg_img_scale", self.config.cfg_img_scale)
-            renorm_type = kwargs.pop("cfg_renorm_type", self.config.cfg_renorm_type)
+        cfg_text_scale = kwargs.pop(
+            "cfg_text_scale", self.config.cfg_text_scale
+        )
+        cfg_img_scale = kwargs.pop(
+            "cfg_img_scale", self.config.cfg_img_scale
+        )
+        renorm_type = kwargs.pop(
+            "cfg_renorm_type", self.config.cfg_renorm_type
+        )
+        cfg_interval = kwargs.pop("cfg_interval", self.config.cfg_interval)
+        cfg_renorm_min = kwargs.pop(
+            "cfg_renorm_min", self.config.cfg_renorm_min
+        )
+        kwargs.pop("cfg_branch_policy", None)
 
-            cfg_interval = kwargs.pop("cfg_interval", self.config.cfg_interval)
+        labels = (
+            tuple(cfg_active_labels)
+            if requires_cfg and cfg_active_labels is not None
+            else CFG_BRANCH_ORDER
+            if requires_cfg
+            else ("main",)
+        )
+        canonical_labels = tuple(
+            label for label in CFG_BRANCH_ORDER if label in labels
+        )
+        if labels != canonical_labels or not labels or labels[0] != "main":
+            raise ValueError(f"Invalid BAGEL active CFG branch set: {labels!r}")
 
-            # Batched CFG: run all 3 branches in a single LLM forward.
-            # plan_attention_batched_cfg created a single FlashInfer plan
-            # treating (main, cfg_text, cfg_img) as 3 "virtual requests".
-            S = empty_combined_emb.shape[0]
-            batched_emb = empty_combined_emb.repeat(3, 1)  # [3S, hidden]
-
-            # Expand MoT indexes with absolute offsets for each copy
+        # One attention plan treats active CFG labels as virtual requests.
+        # A main-only step uses its ordinary label and performs no duplication.
+        S = empty_combined_emb.shape[0]
+        branch_count = len(labels)
+        if branch_count == 1:
+            batched_emb = empty_combined_emb
+            batched_text_indexes = text_indexes
+            batched_vae_indexes = vae_token_indexes
+            batched_text_mask = text_mask
+        else:
+            batched_emb = empty_combined_emb.repeat(branch_count, 1)
             batched_text_indexes = torch.cat([
-                text_indexes + i * S for i in range(3)
+                text_indexes + i * S for i in range(branch_count)
             ])
             batched_vae_indexes = torch.cat([
-                vae_token_indexes + i * S for i in range(3)
+                vae_token_indexes + i * S for i in range(branch_count)
             ])
-            batched_text_mask = text_mask.repeat(3)
+            batched_text_mask = text_mask.repeat(branch_count)
 
-            hidden = self.language_model(
-                batched_emb, mode="gen",
-                label=self.CFG_BATCHED_LABEL,
-                vae_token_indexes=batched_vae_indexes,
-                text_indexes=batched_text_indexes,
-                text_mask=batched_text_mask,
-                **kwargs,
-            )
-
-            # Split output back to 3 branches and select every request's
-            # latent rows from its own BOI/latent/EOI block.
-            v_main = self.llm2vae(hidden[:S])[vae_token_indexes]
-            v_cfg_text = self.llm2vae(hidden[S:2*S])[vae_token_indexes]
-            v_cfg_img = self.llm2vae(hidden[2*S:])[vae_token_indexes]
-
-            # Two-node CFG velocity combination + renormalization
-            cfg_renorm_min = kwargs.pop("cfg_renorm_min", self.config.cfg_renorm_min)
-            v_final = combine_cfg_velocities(
-                v_main,
-                v_cfg_text,
-                v_cfg_img,
-                timestep,
-                latent_lens,
-                cfg_text_scale=cfg_text_scale,
-                cfg_img_scale=cfg_img_scale,
-                cfg_interval=cfg_interval,
-                cfg_renorm_type=renorm_type,
-                cfg_renorm_min=cfg_renorm_min,
-            )
-        else:
-            # No CFG: single forward pass over the declared plan
-            hidden = self.language_model(
-                empty_combined_emb, mode="gen",
-                label="main",
-                vae_token_indexes=vae_token_indexes,
-                text_indexes=text_indexes,
-                text_mask=text_mask,
-                **kwargs,
-            )
-            v_final = self.llm2vae(hidden)[vae_token_indexes]
+        hidden = self.language_model(
+            batched_emb,
+            mode="gen",
+            label=self.CFG_BATCHED_LABEL if branch_count > 1 else "main",
+            vae_token_indexes=batched_vae_indexes,
+            text_indexes=batched_text_indexes,
+            text_mask=batched_text_mask,
+            **kwargs,
+        )
+        branch_velocities = {
+            label: self.llm2vae(hidden[i * S:(i + 1) * S])[
+                vae_token_indexes
+            ]
+            for i, label in enumerate(labels)
+        }
+        v_final = combine_pruned_cfg_velocities(
+            branch_velocities,
+            timestep,
+            latent_lens,
+            cfg_text_scale=cfg_text_scale,
+            cfg_img_scale=cfg_img_scale,
+            cfg_interval=cfg_interval,
+            cfg_renorm_type=renorm_type,
+            cfg_renorm_min=cfg_renorm_min,
+        )
 
         # Euler step: x_{t-dt} = x_t - v * dt  (velocity points data -> noise)
         dt = dt.reshape((-1,) + (1,) * (latents.ndim - 1))
@@ -1421,6 +1549,7 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("cfg_renorm_type", None)
         kwargs.pop("cfg_interval", None)
         kwargs.pop("cfg_renorm_min", None)
+        kwargs.pop("cfg_branch_policy", None)
 
         latents = input_embeds
 
@@ -1509,6 +1638,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 "cfg_interval",
                 "cfg_renorm_type",
                 "cfg_renorm_min",
+                "cfg_branch_policy",
             )
             infos = [
                 engine_inputs.per_request_info[rid].step_metadata
@@ -1532,12 +1662,19 @@ class LLMSubmodule(ARNodeSubmodule):
                 requires_cfg=requires_cfg,
                 **kwargs,
             )
-            return split_image_gen_outputs(
+            split = split_image_gen_outputs(
                 request_ids,
                 out["latents"][0],
                 out["time_index"][0],
                 latent_lens,
             )
+            for request_id in request_ids:
+                self._maybe_dump_image_latents(
+                    request_id,
+                    engine_inputs.per_request_info[request_id],
+                    split[request_id],
+                )
+            return split
         elif graph_walk == "decode":
             out = self._forward_decode_batched(
                 input_ids=input_ids,
@@ -1645,7 +1782,8 @@ class LLMSubmodule(ARNodeSubmodule):
             if required.difference(tensors):
                 return False
             layout_keys.add((
-                bool(inp.resource_step_info),
+                requires_cfg_for_inputs([inp]),
+                image_cfg_labels_for_inputs([inp]),
                 int(inp.input_seq_len),
                 tuple(inp.input_embeds.shape),
                 inp.input_embeds.dtype,
@@ -1662,6 +1800,7 @@ class LLMSubmodule(ARNodeSubmodule):
             "cfg_interval",
             "cfg_renorm_type",
             "cfg_renorm_min",
+            "cfg_branch_policy",
         )
         configured = set()
         for info in batch.per_request_info.values():

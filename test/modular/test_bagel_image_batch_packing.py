@@ -12,8 +12,11 @@ import unittest
 import torch
 
 from mstar.model.bagel.batching import (
+    cfg_branch_labels_for_step,
     collate_image_gen_inputs,
     combine_cfg_velocities,
+    combine_pruned_cfg_velocities,
+    shifted_timestep_for_step,
     split_image_gen_outputs,
 )
 from mstar.model.submodule_base import ARNodeInputs
@@ -214,6 +217,135 @@ class HeterogeneousCFGTest(unittest.TestCase):
                         cfg_renorm_min=0.0,
                     )
                     torch.testing.assert_close(actual, expected)
+
+
+class CFGBranchPruningTest(unittest.TestCase):
+    _DEFAULTS = {
+        "requires_cfg": True,
+        "num_timesteps": 50,
+        "timestep_shift": 3.0,
+        "cfg_text_scale": 4.0,
+        "cfg_img_scale": 1.0,
+        "cfg_interval": (0.4, 1.0),
+    }
+
+    def _labels(self, step: int, policy: str, **overrides):
+        kwargs = {**self._DEFAULTS, **overrides, "policy": policy}
+        return cfg_branch_labels_for_step(step, **kwargs)
+
+    def test_default_cfg_boundary_is_derived_as_steps_40_to_41(self):
+        self.assertGreater(
+            shifted_timestep_for_step(
+                40, num_timesteps=50, timestep_shift=3.0
+            ),
+            0.4,
+        )
+        self.assertLessEqual(
+            shifted_timestep_for_step(
+                41, num_timesteps=50, timestep_shift=3.0
+            ),
+            0.4,
+        )
+        self.assertEqual(
+            self._labels(40, "auto"), ("main", "cfg_text")
+        )
+        self.assertEqual(self._labels(41, "auto"), ("main",))
+
+    def test_experiment_arms_have_the_intended_branch_counts(self):
+        expected = {
+            "reference": (3, 3),
+            "drop_image": (2, 2),
+            "late_main": (3, 1),
+            "auto": (2, 1),
+            "main_only": (1, 1),
+        }
+        for policy, counts in expected.items():
+            with self.subTest(policy=policy):
+                self.assertEqual(len(self._labels(40, policy)), counts[0])
+                self.assertEqual(len(self._labels(41, policy)), counts[1])
+
+    def test_image_guidance_is_not_pruned_when_its_scale_is_active(self):
+        for step in (0, 48):
+            with self.subTest(step=step):
+                self.assertEqual(
+                    self._labels(
+                        step,
+                        "auto",
+                        cfg_img_scale=2.0,
+                        cfg_interval=(0.0, 1.0),
+                    ),
+                    ("main", "cfg_text", "cfg_img"),
+                )
+
+    def test_cfg_off_always_uses_main_only(self):
+        for policy in (
+            "reference", "drop_image", "late_main", "auto", "main_only"
+        ):
+            self.assertEqual(
+                self._labels(0, policy, requires_cfg=False), ("main",)
+            )
+
+    def test_all_three_rows_delegate_to_reference_formula_exactly(self):
+        main = torch.tensor([[1.0, 2.0], [2.0, 1.0]])
+        text = torch.tensor([[0.5, 0.0], [0.0, 0.5]])
+        image = torch.tensor([[0.25, 0.25], [0.25, 0.25]])
+        timestep = torch.full((2,), 0.8)
+        kwargs = dict(
+            cfg_text_scale=4.0,
+            cfg_img_scale=1.5,
+            cfg_interval=(0.4, 1.0),
+            cfg_renorm_type="global",
+            cfg_renorm_min=0.0,
+        )
+
+        reference = combine_cfg_velocities(
+            main, text, image, timestep, [2], **kwargs
+        )
+        pruned_helper = combine_pruned_cfg_velocities(
+            {"main": main, "cfg_text": text, "cfg_img": image},
+            timestep,
+            [2],
+            **kwargs,
+        )
+
+        self.assertTrue(torch.equal(reference, pruned_helper))
+
+    def test_inactive_image_row_can_be_removed_from_default_text_to_image(self):
+        main = torch.tensor([[1.0, 2.0], [2.0, 1.0]])
+        text = torch.tensor([[0.5, 0.0], [0.0, 0.5]])
+        image = torch.tensor([[30.0, 30.0], [30.0, 30.0]])
+        timestep = torch.full((2,), 0.8)
+        kwargs = dict(
+            cfg_text_scale=4.0,
+            cfg_img_scale=1.0,
+            cfg_interval=(0.4, 1.0),
+            cfg_renorm_type="global",
+            cfg_renorm_min=0.0,
+        )
+
+        reference = combine_cfg_velocities(
+            main, text, image, timestep, [2], **kwargs
+        )
+        without_image = combine_pruned_cfg_velocities(
+            {"main": main, "cfg_text": text}, timestep, [2], **kwargs
+        )
+
+        self.assertTrue(torch.equal(reference, without_image))
+
+    def test_main_only_late_step_returns_main_velocity(self):
+        main = torch.tensor([[1.0, 2.0], [2.0, 1.0]])
+        actual = combine_pruned_cfg_velocities(
+            {"main": main},
+            torch.full((2,), 0.2),
+            [2],
+            cfg_text_scale=4.0,
+            cfg_img_scale=1.0,
+            cfg_interval=(0.4, 1.0),
+            cfg_renorm_type="global",
+            cfg_renorm_min=0.0,
+        )
+
+        self.assertIs(actual, main)
 
 
 class ImageBatchOutputSplittingTest(unittest.TestCase):

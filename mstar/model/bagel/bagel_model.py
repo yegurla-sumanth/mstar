@@ -67,6 +67,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.bagel.batching import CFG_BRANCH_POLICIES
 from mstar.model.bagel.components.autoencoder import BagelAutoEncoder
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
@@ -1039,6 +1040,7 @@ class BagelModel(Model):
                     # serial steps preserve the handoff's output.
                     enable_async_scheduling=not self._image_gen_remote_handoff,
                 ),
+                name="image_gen_loop",
                 max_iters=self.config.num_timesteps - 1,
                 outputs=[
                     GraphEdge(next_node="vae_decoder", name="latents"),
@@ -1108,6 +1110,7 @@ class BagelModel(Model):
                         enable_async_scheduling=False
                     ),
                 ]),
+                name="image_gen_cfg_loop",
                 max_iters=self.config.num_timesteps - 1,
                 outputs=[
                     GraphEdge(next_node="vae_decoder", name="latents"),
@@ -1204,6 +1207,7 @@ class BagelModel(Model):
             "cfg_interval": full_metadata.kwargs["cfg_interval"],
             "cfg_renorm_type": full_metadata.kwargs["cfg_renorm_type"],
             "cfg_renorm_min": full_metadata.kwargs["cfg_renorm_min"],
+            "cfg_branch_policy": full_metadata.kwargs["cfg_branch_policy"],
             "width": full_metadata.kwargs["width"],
             "height": full_metadata.kwargs["height"],
             "image_preprocess": full_metadata.kwargs["image_preprocess"],
@@ -1308,7 +1312,8 @@ class BagelModel(Model):
         # Per-request overrides with config defaults
         overridable_keys = [
             "cfg_text_scale", "cfg_img_scale", "cfg_interval",
-            "cfg_renorm_type", "cfg_renorm_min", "think_mode",
+            "cfg_renorm_type", "cfg_renorm_min", "cfg_branch_policy",
+            "think_mode",
         ]
         params = {k: getattr(self.config, k) for k in overridable_keys}
         params["width"] = 1024
@@ -1325,6 +1330,13 @@ class BagelModel(Model):
             for key in overridable_keys:
                 if key in model_kwargs:
                     params[key] = model_kwargs[key]
+
+        if params["cfg_branch_policy"] not in CFG_BRANCH_POLICIES:
+            raise ValueError(
+                "Unsupported BAGEL cfg_branch_policy "
+                f"{params['cfg_branch_policy']!r}; expected one of "
+                f"{sorted(CFG_BRANCH_POLICIES)}"
+            )
 
         if "image" in output_modalities and input_signals.get("image_inputs"):
             image = input_signals["image_inputs"][0]
