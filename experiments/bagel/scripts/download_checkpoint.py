@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     from huggingface_hub import snapshot_download
+    from safetensors import safe_open
 
     started = datetime.now(timezone.utc)
     snapshot = Path(
@@ -69,6 +70,17 @@ def main() -> int:
             # every multi-gigabyte weight file solely to hash it again.
             "cache_blob": resolved.name if resolved != path else None,
         }
+        if path.suffix == ".safetensors":
+            # Reading the key table is inexpensive and catches truncated files,
+            # Git-LFS pointer payloads, and cache filesystems that cannot serve
+            # safetensors correctly before an expensive model startup attempt.
+            try:
+                with safe_open(str(path), framework="pt", device="cpu") as handle:
+                    entry["safetensors_key_count"] = len(handle.keys())
+            except Exception as exc:
+                raise RuntimeError(
+                    f"invalid safetensors checkpoint file {path}: {exc}"
+                ) from exc
         if size <= SMALL_HASH_LIMIT:
             entry["sha256"] = sha256(path)
         files.append(entry)
