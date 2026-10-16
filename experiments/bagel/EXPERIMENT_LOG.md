@@ -288,3 +288,27 @@ post-step latents after steps 0, 20, 40, 41, and 48, final-image comparisons,
 per-step trace timing, and a four-panel plot. Latent dumping synchronizes the
 GPU, so this first gate cannot support a speedup claim. Repeated performance
 measurement will be a separate no-dump run after numerical review.
+
+## 2026-10-16 — Step 4 A100 failures and eager recovery
+
+The initial A100 gate completed its reference arm but failed on the first
+`drop_image` request with `KeyError: 'cfg_img'` under the engine's compiled
+LLM forward. Two attempts to isolate the dynamic branch mapping from Dynamo
+did not remove that compiled-path failure. These failed runs do not provide
+policy correctness or performance results.
+
+A correctness-only retry set `TORCH_COMPILE_DISABLE=1`. It stopped during the
+unmeasured reference warm-up, before any policy measurement, with an eager
+indexed-assignment error: the combined image sequence was fp32 while the
+autocast projection was bf16. The downloaded evidence is
+`cfg_orchestrator.json`, `cfg_sweep_client.log`, and `server.log` from
+`cfg_branch_gate_b1_eager_correctness_2ca09bfc`; server readiness was 48.052
+seconds and shutdown was the orchestrator's intentional SIGTERM.
+
+Revision `751b483336adaac412446ad4ca4c36c701b4991d` makes the storage cast
+explicit and makes the engine skip installing compile wrappers when
+`TORCH_COMPILE_DISABLE=1`. The clean Step 4 notebook is pinned to that
+revision and labels the next run as eager correctness only. Python syntax and
+Git whitespace checks pass locally; the new tensor regression test and the
+full gate still require the CUDA environment. Compiled performance remains a
+separate unresolved gate.
