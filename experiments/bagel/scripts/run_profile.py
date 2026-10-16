@@ -16,9 +16,11 @@ from run_smoke import (
     atomic_json,
     command_result,
     file_sha256,
-    healthy,
-    stop_process_group,
     tail,
+)
+from experiment_runtime import (
+    handle_interrupts, progress, require_free_port, require_local_storage,
+    run_logged, stop_owned_group, wait_for_server,
 )
 
 
@@ -35,6 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--num-requests", type=int, default=6)
     parser.add_argument("--stagger-seconds", type=float, default=8.0)
+    parser.add_argument("--cfg-branch-policy", choices=("reference", "drop_image"), default="reference")
+    parser.add_argument("--base-seed", type=int, default=20261016)
+    parser.add_argument("--warmup-requests", type=int, default=1)
+    parser.add_argument("--eager", action="store_true")
+    parser.add_argument("--capture-latents", action="store_true",
+                        help="Diagnostic gate only; synchronizes selected steps, invalidates performance timing")
     parser.add_argument(
         "--image-batch-max-size",
         type=int,
@@ -57,7 +65,11 @@ def main() -> int:
     repo_root = args.repo_root.resolve()
     config = args.config if args.config.is_absolute() else repo_root / args.config
     output_dir = args.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    require_local_storage(output_dir, args.cache_dir, repo_root)
+    require_free_port(args.port)
+    if args.num_requests < 1 or args.warmup_requests < 1 or args.stagger_seconds < 0:
+        raise ValueError("Request counts must be positive and stagger must be non-negative")
+    output_dir.mkdir(parents=True, exist_ok=False)
     trace_dir = output_dir / "execution_trace"
     trace_dir.mkdir(parents=True, exist_ok=True)
     server_log_path = output_dir / "server.log"
@@ -104,6 +116,9 @@ def main() -> int:
         str(args.stagger_seconds),
         "--timeout-seconds",
         str(args.request_timeout_seconds),
+        "--cfg-branch-policy", args.cfg_branch_policy,
+        "--base-seed", str(args.base_seed),
+        "--warmup-requests", str(args.warmup_requests),
     ]
     env = os.environ.copy()
     # Keep the invoked interpreter path instead of resolving its symlink: uv
@@ -121,11 +136,21 @@ def main() -> int:
             "MSTAR_RUST_ZMQ": "0",
             "PATH": (venv_bin if not inherited_path else os.pathsep.join((venv_bin, inherited_path))),
             "PYTHONUNBUFFERED": "1",
+            "MPLBACKEND": "Agg",
+            "PYTHONPATH": os.pathsep.join(filter(None, (str(repo_root), env.get("PYTHONPATH")))),
         }
     )
+    if args.eager:
+        env["TORCH_COMPILE_DISABLE"] = "1"
+    env.pop("MSTAR_BAGEL_DEBUG_LATENT_DIR", None)
+    env.pop("MSTAR_BAGEL_DEBUG_LATENT_STEPS", None)
+    if args.capture_latents:
+        env["MSTAR_BAGEL_DEBUG_LATENT_DIR"] = str(output_dir / "debug_latents")
+        env["MSTAR_BAGEL_DEBUG_LATENT_STEPS"] = "0,20,40,41,48"
     started_utc = datetime.now(timezone.utc)
     summary = {
-        "status": "failed",
+        "status": "running",
+        "stage": "server_startup",
         "started_utc": started_utc.isoformat(),
         "repo": {
             "head": command_result(["git", "rev-parse", "HEAD"], repo_root),
@@ -134,10 +159,14 @@ def main() -> int:
         },
         "config": {"path": str(config), "sha256": file_sha256(config)},
         "workload": {
-            "warmup_requests": 1,
+            "warmup_requests": args.warmup_requests,
             "measured_requests": args.num_requests,
             "stagger_seconds": args.stagger_seconds,
             "image_batch_max_size": args.image_batch_max_size,
+            "cfg_branch_policy": args.cfg_branch_policy,
+            "base_seed": args.base_seed,
+            "latent_capture_enabled": args.capture_latents,
+            "torch_compile_disabled": env.get("TORCH_COMPILE_DISABLE") == "1",
         },
         "server_command": server_command,
         "client_command": client_command,
@@ -156,10 +185,9 @@ def main() -> int:
     }
     atomic_json(summary_path, summary)
     process = None
-    caught: Exception | None = None
+    caught: BaseException | None = None
     server_log = server_log_path.open("ab", buffering=0)
     try:
-        server_started = time.perf_counter()
         process = subprocess.Popen(
             server_command,
             cwd=repo_root,
@@ -170,35 +198,16 @@ def main() -> int:
             start_new_session=True,
         )
         summary["server_pid"] = process.pid
-        deadline = time.monotonic() + args.server_start_timeout_seconds
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise RuntimeError(
-                    f"server exited before health with code {process.returncode}\n{tail(server_log_path)}"
-                )
-            if healthy(base_url):
-                break
-            time.sleep(2)
-        else:
-            raise TimeoutError(
-                "server did not become healthy within "
-                f"{args.server_start_timeout_seconds:.0f}s\n{tail(server_log_path)}"
-            )
-        summary["server_ready_seconds"] = time.perf_counter() - server_started
         atomic_json(summary_path, summary)
-
-        with client_log_path.open("wb") as client_log:
-            client = subprocess.run(
-                client_command,
-                cwd=repo_root,
-                env=env,
-                stdout=client_log,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-        summary["profile_client_returncode"] = client.returncode
-        if client.returncode != 0:
-            raise RuntimeError(f"profile client failed with code {client.returncode}\n{tail(client_log_path)}")
+        summary["server_ready_seconds"] = wait_for_server(
+            process, base_url, server_log_path, timeout=args.server_start_timeout_seconds)
+        summary["stage"] = "warmup_and_measurement"
+        atomic_json(summary_path, summary)
+        run_logged(client_command, client_log_path, cwd=repo_root, env=env,
+                   stage=f"B={args.image_batch_max_size} {args.cfg_branch_policy}", server=process,
+                   timeout=(args.num_requests + args.warmup_requests) * args.request_timeout_seconds
+                   + (args.num_requests + args.warmup_requests) * args.stagger_seconds + 120)
+        summary["profile_client_returncode"] = 0
         profile_summary = json.loads((output_dir / "profile_summary.json").read_text())
         if profile_summary.get("status") != "success":
             raise RuntimeError(f"profile summary status is {profile_summary.get('status')!r}")
@@ -207,37 +216,43 @@ def main() -> int:
             raise RuntimeError("execution trace contains no worker records")
         summary["execution_trace_files"] = [str(path) for path in trace_files]
         summary["status"] = "success"
-    except Exception as exc:
+    except BaseException as exc:
+        summary["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
         summary["error_type"] = type(exc).__name__
         summary["error"] = str(exc)
         caught = exc
     finally:
         if process is not None:
             try:
-                summary["shutdown"] = stop_process_group(process, args.shutdown_timeout_seconds)
+                unexpected_exit = process.poll() is not None
+                summary["shutdown"] = stop_owned_group(process, args.shutdown_timeout_seconds)
+                if summary["status"] == "success" and (
+                    unexpected_exit or summary["shutdown"]["method"] != "sigterm"
+                ):
+                    summary["status"] = "failed_shutdown"
             except Exception as exc:  # noqa: BLE001 - preserve primary error
                 summary["shutdown"] = {
                     "method": "error",
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                 }
+                if summary["status"] == "success":
+                    summary["status"] = "failed_shutdown"
         server_log.close()
         summary["finished_utc"] = datetime.now(timezone.utc).isoformat()
         summary["elapsed_seconds"] = (datetime.fromisoformat(summary["finished_utc"]) - started_utc).total_seconds()
         summary["nvidia_smi_after"] = command_result(["nvidia-smi"], repo_root)
         summary["server_log_tail"] = tail(server_log_path)
+        summary["stage"] = "finished"
         atomic_json(summary_path, summary)
+        progress(f"Profile {summary['status']}: {output_dir}")
     if caught is not None:
         raise caught
-    if summary.get("shutdown", {}).get("method") not in {
-        "sigterm",
-        "already_exited",
-    }:
-        summary["status"] = "failed_shutdown"
-        atomic_json(summary_path, summary)
+    if summary["status"] != "success":
         return 1
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    with handle_interrupts():
+        raise SystemExit(main())

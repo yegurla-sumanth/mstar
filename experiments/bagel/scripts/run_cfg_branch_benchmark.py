@@ -16,9 +16,11 @@ from run_smoke import (
     atomic_json,
     command_result,
     file_sha256,
-    healthy,
-    stop_process_group,
     tail,
+)
+from experiment_runtime import (
+    handle_interrupts, progress, require_free_port, require_local_storage,
+    run_logged, stop_owned_group, wait_for_server,
 )
 
 
@@ -47,6 +49,8 @@ def main() -> int:
     repo_root = args.repo_root.resolve()
     config = args.config if args.config.is_absolute() else repo_root / args.config
     output_dir = args.output_dir.resolve()
+    require_local_storage(output_dir, args.cache_dir, repo_root)
+    require_free_port(args.port)
     if output_dir.exists():
         raise FileExistsError(
             f"refusing to mix benchmark attempts in existing path: {output_dir}"
@@ -144,7 +148,8 @@ def main() -> int:
     env.pop("MSTAR_BAGEL_DEBUG_LATENT_STEPS", None)
     started_utc = datetime.now(timezone.utc)
     summary = {
-        "status": "failed",
+        "status": "running",
+        "stage": "unit_tests",
         "started_utc": started_utc.isoformat(),
         "repo": {
             "head": command_result(["git", "rev-parse", "HEAD"], repo_root),
@@ -186,12 +191,14 @@ def main() -> int:
     }
     atomic_json(summary_path, summary)
     process = None
-    caught: Exception | None = None
+    caught: BaseException | None = None
     server_log = server_log_path.open("ab", buffering=0)
     try:
-        for command in test_commands:
-            subprocess.run(command, cwd=repo_root, env=env, check=True)
-        server_started = time.perf_counter()
+        for index, command in enumerate(test_commands):
+            run_logged(command, output_dir / f"unit_{index}.log", cwd=repo_root,
+                       env=env, stage=f"unit test {index+1}", timeout=300)
+        summary["stage"] = "server_startup"
+        atomic_json(summary_path, summary)
         process = subprocess.Popen(
             server_command,
             cwd=repo_root,
@@ -202,76 +209,48 @@ def main() -> int:
             start_new_session=True,
         )
         summary["server_pid"] = process.pid
-        deadline = time.monotonic() + args.server_start_timeout_seconds
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise RuntimeError(
-                    "server exited before health with code "
-                    f"{process.returncode}\n{tail(server_log_path)}"
-                )
-            if healthy(base_url):
-                break
-            time.sleep(2)
-        else:
-            raise TimeoutError(
-                "server did not become healthy within "
-                f"{args.server_start_timeout_seconds:.0f}s\n"
-                f"{tail(server_log_path)}"
-            )
-        summary["server_ready_seconds"] = time.perf_counter() - server_started
         atomic_json(summary_path, summary)
-
-        with client_log_path.open("wb") as client_log:
-            client = subprocess.run(
-                client_command,
-                cwd=repo_root,
-                env=env,
-                stdout=client_log,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-        summary["client_returncode"] = client.returncode
-        if client.returncode != 0:
-            raise RuntimeError(
-                f"CFG benchmark client failed with code {client.returncode}\n"
-                f"{tail(client_log_path)}"
-            )
-
-        with analysis_log_path.open("wb") as analysis_log:
-            analysis = subprocess.run(
-                analysis_command,
-                cwd=repo_root,
-                env=env,
-                stdout=analysis_log,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-        summary["analysis_returncode"] = analysis.returncode
-        if analysis.returncode != 0:
-            raise RuntimeError(
-                f"CFG benchmark analysis failed with code {analysis.returncode}\n"
-                f"{tail(analysis_log_path)}"
-            )
+        summary["server_ready_seconds"] = wait_for_server(
+            process, base_url, server_log_path, timeout=args.server_start_timeout_seconds)
+        summary["stage"] = "warmup_and_measurement"
+        atomic_json(summary_path, summary)
+        run_logged(client_command, client_log_path, cwd=repo_root, env=env,
+                   stage="paired B=1 benchmark", server=process,
+                   timeout=(2 + 2 * args.repeats) * args.request_timeout_seconds + 120)
+        summary["client_returncode"] = 0
+        summary["stage"] = "analysis"
+        atomic_json(summary_path, summary)
+        run_logged(analysis_command, analysis_log_path, cwd=repo_root, env=env,
+                   stage="analysis", server=process, timeout=300)
+        summary["analysis_returncode"] = 0
         summary["analysis"] = json.loads(
             (output_dir / "cfg_branch_benchmark_analysis.json").read_text()
         )
         summary["status"] = "success"
-    except Exception as exc:
+    except BaseException as exc:
+        summary["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
         summary["error_type"] = type(exc).__name__
         summary["error"] = str(exc)
         caught = exc
     finally:
         if process is not None:
             try:
-                summary["shutdown"] = stop_process_group(
+                unexpected_exit = process.poll() is not None
+                summary["shutdown"] = stop_owned_group(
                     process, args.shutdown_timeout_seconds
                 )
+                if summary["status"] == "success" and (
+                    unexpected_exit or summary["shutdown"]["method"] != "sigterm"
+                ):
+                    summary["status"] = "failed_shutdown"
             except Exception as exc:  # noqa: BLE001 - preserve primary error
                 summary["shutdown"] = {
                     "method": "error",
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                 }
+                if summary["status"] == "success":
+                    summary["status"] = "failed_shutdown"
         server_log.close()
         summary["finished_utc"] = datetime.now(timezone.utc).isoformat()
         summary["elapsed_seconds"] = (
@@ -281,18 +260,16 @@ def main() -> int:
             ["nvidia-smi"], repo_root
         )
         summary["server_log_tail"] = tail(server_log_path)
+        summary["stage"] = "finished"
         atomic_json(summary_path, summary)
+        progress(f"Benchmark {summary['status']}; artifacts: {output_dir}")
     if caught is not None:
         raise caught
-    if summary.get("shutdown", {}).get("method") not in {
-        "sigterm", "already_exited"
-    }:
-        summary["status"] = "failed_shutdown"
-        atomic_json(summary_path, summary)
+    if summary["status"] != "success":
         return 1
-    print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    with handle_interrupts():
+        raise SystemExit(main())

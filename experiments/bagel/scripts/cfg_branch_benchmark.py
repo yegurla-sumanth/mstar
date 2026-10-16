@@ -12,6 +12,7 @@ from pathlib import Path
 
 from cfg_branch_sweep import run_request
 from smoke_image import GPUSampler, atomic_json
+from experiment_runtime import progress, require_local_storage
 
 
 POLICIES = ("reference", "drop_image")
@@ -38,6 +39,7 @@ def main() -> int:
     args = parse_args()
     if args.repeats < 2:
         raise ValueError("--repeats must be at least 2 for dispersion reporting")
+    require_local_storage(args.output_dir)
 
     from mstar import MStarClient
 
@@ -48,7 +50,7 @@ def main() -> int:
 
     run_tag = uuid.uuid4().hex[:8]
     summary = {
-        "status": "failed",
+        "status": "running",
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "run_tag": run_tag,
         "measurement_boundary": (
@@ -80,6 +82,7 @@ def main() -> int:
     try:
         with sampler:
             for warmup_index, policy in enumerate(POLICIES):
+                progress(f"Warm-up {warmup_index+1}/2: {policy}")
                 record = run_request(
                     client=client,
                     output_dir=args.output_dir,
@@ -98,10 +101,12 @@ def main() -> int:
                     raise RuntimeError(
                         f"{policy} warm-up failed: {record.get('error')}"
                     )
+                progress(f"Warm-up {policy} complete: {record['client_elapsed_seconds']:.2f}s")
 
             for repeat in range(args.repeats):
                 order = POLICIES if repeat % 2 == 0 else tuple(reversed(POLICIES))
                 for policy in order:
+                    progress(f"Pair {repeat+1}/{args.repeats}: starting {policy}")
                     record = run_request(
                         client=client,
                         output_dir=args.output_dir,
@@ -120,8 +125,14 @@ def main() -> int:
                         raise RuntimeError(
                             f"{policy} repeat {repeat} failed: {record.get('error')}"
                         )
+                    progress(f"Pair {repeat+1}/{args.repeats}: {policy} complete in {record['client_elapsed_seconds']:.2f}s")
+                pair = summary["measured_requests"][-2:]
+                if Path(pair[0]["image"]["path"]).read_bytes() != Path(pair[1]["image"]["path"]).read_bytes():
+                    raise RuntimeError(f"PNG equality gate failed at pair {repeat}; stopping before more requests")
+                progress(f"Pair {repeat+1}/{args.repeats}: exact PNG equality passed")
         summary["status"] = "success"
-    except Exception as exc:
+    except BaseException as exc:
+        summary["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
         summary["error_type"] = type(exc).__name__
         summary["error"] = str(exc)
         raise
@@ -136,7 +147,7 @@ def main() -> int:
             args.output_dir / "gpu_samples.json", {"samples": sampler.samples}
         )
 
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    progress(f"All {args.repeats} pairs complete; summary: {summary_path}")
     return 0
 
 

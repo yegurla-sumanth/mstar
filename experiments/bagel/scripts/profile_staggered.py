@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from smoke_image import GPUSampler, atomic_json, validate_png
+from experiment_runtime import progress, require_local_storage
 
 
 class JsonlWriter:
@@ -50,6 +51,8 @@ def parse_args() -> argparse.Namespace:
         default="A red panda reading a systems paper in a university library",
     )
     parser.add_argument("--base-seed", type=int, default=20261016)
+    parser.add_argument("--cfg-branch-policy", choices=("reference", "drop_image"), default="reference")
+    parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=1024)
     return parser.parse_args()
@@ -69,9 +72,13 @@ def run_request(
     timeout_seconds: float,
     target_perf_ns: int,
     events: JsonlWriter,
+    cfg_branch_policy: str = "reference",
 ) -> dict:
     from mstar import MStarClient
 
+    request_dir = output_dir / "requests" / request_id
+    request_dir.mkdir(parents=True, exist_ok=True)
+    client = MStarClient(base_url, timeout=timeout_seconds)
     remaining = (target_perf_ns - time.perf_counter_ns()) / 1e9
     if remaining > 0:
         time.sleep(remaining)
@@ -97,14 +104,16 @@ def run_request(
         "seed": seed,
         "width": width,
         "height": height,
+        "cfg_branch_policy": cfg_branch_policy,
+        "cfg_text_scale": 4.0,
+        "cfg_img_scale": 1.0,
+        "cfg_interval": [0.4, 1.0],
         "target_perf_ns": target_perf_ns,
         "submit_perf_ns": submit_perf_ns,
         "submit_wall_ns": submit_wall_ns,
+        "submission_lag_seconds": max(0, (submit_perf_ns - target_perf_ns) / 1e9),
     }
-    request_dir = output_dir / "requests" / request_id
-    request_dir.mkdir(parents=True, exist_ok=True)
     try:
-        client = MStarClient(base_url, timeout=timeout_seconds)
         result = client.generate(
             text=prompt,
             output_modalities=("image",),
@@ -113,6 +122,10 @@ def run_request(
             width=width,
             height=height,
             think_mode=False,
+            cfg_branch_policy=cfg_branch_policy,
+            cfg_text_scale=4.0,
+            cfg_img_scale=1.0,
+            cfg_interval=[0.4, 1.0],
         )
         complete_perf_ns = time.perf_counter_ns()
         complete_wall_ns = time.time_ns()
@@ -165,16 +178,18 @@ def run_request(
             error=record["error"],
         )
     atomic_json(request_dir / "result.json", record)
+    progress(f"{phase} request {request_index}: {record['status']} in {record['client_elapsed_seconds']:.1f}s")
     return record
 
 
 def main() -> int:
     args = parse_args()
-    if args.num_requests < 1:
-        raise ValueError("--num-requests must be positive")
+    if args.num_requests < 1 or args.warmup_requests < 1:
+        raise ValueError("Request and warm-up counts must be positive")
     if args.stagger_seconds < 0:
         raise ValueError("--stagger-seconds must be non-negative")
 
+    require_local_storage(args.output_dir)
     from mstar import MStarClient
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -186,11 +201,11 @@ def main() -> int:
     events = JsonlWriter(args.output_dir / "client_events.jsonl")
     sampler = GPUSampler(args.gpu_sample_period_seconds)
     summary = {
-        "status": "failed",
+        "status": "running",
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "run_tag": run_tag,
         "workload": {
-            "warmup_requests": 1,
+            "warmup_requests": args.warmup_requests,
             "measured_requests": args.num_requests,
             "stagger_seconds": args.stagger_seconds,
             "prompt": args.prompt,
@@ -198,31 +213,43 @@ def main() -> int:
             "width": args.width,
             "height": args.height,
             "expected_num_timesteps": 50,
+            "cfg_branch_policy": args.cfg_branch_policy,
+            "cfg_text_scale": 4.0,
+            "cfg_img_scale": 1.0,
+            "cfg_interval": [0.4, 1.0],
         },
     }
     atomic_json(args.output_dir / "profile_summary.json", summary)
+
+    def cohort(phase, count, start):
+        rows = []
+        summary[f"{phase}_requests"] = rows
+        progress(f"Starting {phase}: {count} requests, {args.stagger_seconds}s apart")
+        with ThreadPoolExecutor(max_workers=count) as executor:
+            futures = [executor.submit(
+                run_request,
+                base_url=args.base_url, output_dir=args.output_dir,
+                request_id=f"bagel-{phase}-{index:02d}-{run_tag}",
+                request_index=index if phase == "measured" else -index - 1,
+                phase=phase, prompt=args.prompt,
+                seed=args.base_seed + index if phase == "measured" else args.base_seed - index - 1,
+                width=args.width, height=args.height,
+                timeout_seconds=args.timeout_seconds,
+                target_perf_ns=start + int(index * args.stagger_seconds * 1e9),
+                events=events, cfg_branch_policy=args.cfg_branch_policy,
+            ) for index in range(count)]
+            for future in as_completed(futures):
+                rows.append(future.result())
+                rows.sort(key=lambda row: row["request_index"])
+                atomic_json(args.output_dir / "profile_summary.json", summary)
+        if any(row["status"] != "success" for row in rows):
+            raise RuntimeError(f"{phase} cohort contains failed requests; see per-request result.json")
+        return rows
+
     try:
         with sampler:
-            warmup_id = f"bagel-warmup-{run_tag}"
-            warmup_start = time.perf_counter_ns()
-            warmup = run_request(
-                base_url=args.base_url,
-                output_dir=args.output_dir,
-                request_id=warmup_id,
-                request_index=-1,
-                phase="warmup",
-                prompt=args.prompt,
-                seed=args.base_seed - 1,
-                width=args.width,
-                height=args.height,
-                timeout_seconds=args.timeout_seconds,
-                target_perf_ns=warmup_start,
-                events=events,
-            )
-            summary["warmup"] = warmup
-            atomic_json(args.output_dir / "profile_summary.json", summary)
-            if warmup["status"] != "success":
-                raise RuntimeError(f"warm-up request failed: {warmup.get('error')}")
+            warmups = cohort("warmup", args.warmup_requests, time.perf_counter_ns())
+            summary["warmup"] = warmups[0]  # retain compatibility with earlier plotting
 
             measurement_start_perf_ns = time.perf_counter_ns()
             measurement_start_wall_ns = time.time_ns()
@@ -230,38 +257,18 @@ def main() -> int:
             summary["measurement_start_wall_ns"] = measurement_start_wall_ns
             atomic_json(args.output_dir / "profile_summary.json", summary)
 
-            futures = []
-            with ThreadPoolExecutor(max_workers=args.num_requests) as executor:
-                for index in range(args.num_requests):
-                    request_id = f"bagel-measured-{index:02d}-{run_tag}"
-                    target_ns = measurement_start_perf_ns + int(index * args.stagger_seconds * 1e9)
-                    futures.append(
-                        executor.submit(
-                            run_request,
-                            base_url=args.base_url,
-                            output_dir=args.output_dir,
-                            request_id=request_id,
-                            request_index=index,
-                            phase="measured",
-                            prompt=args.prompt,
-                            seed=args.base_seed + index,
-                            width=args.width,
-                            height=args.height,
-                            timeout_seconds=args.timeout_seconds,
-                            target_perf_ns=target_ns,
-                            events=events,
-                        )
-                    )
-                measured = [future.result() for future in as_completed(futures)]
+            measured = cohort("measured", args.num_requests, measurement_start_perf_ns)
 
         measured.sort(key=lambda row: row["request_index"])
         summary["measured_requests"] = measured
-        summary["measurement_finished_perf_ns"] = time.perf_counter_ns()
-        summary["measurement_finished_wall_ns"] = time.time_ns()
+        summary["measurement_finished_perf_ns"] = max(row["complete_perf_ns"] for row in measured)
+        summary["measurement_finished_wall_ns"] = max(row["complete_wall_ns"] for row in measured)
         summary["status"] = "success" if all(row["status"] == "success" for row in measured) else "failed"
-    except Exception as exc:
+    except BaseException as exc:
+        summary["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
         summary["error_type"] = type(exc).__name__
         summary["error"] = str(exc)
+        raise
     finally:
         events.close()
         summary["finished_utc"] = datetime.now(timezone.utc).isoformat()
@@ -275,7 +282,7 @@ def main() -> int:
         }
         atomic_json(args.output_dir / "gpu_samples.json", {"samples": sampler.samples})
         atomic_json(args.output_dir / "profile_summary.json", summary)
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    progress(f"Profile client {summary['status']}: {args.output_dir}")
     return 0 if summary["status"] == "success" else 1
 
 

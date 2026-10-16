@@ -67,11 +67,11 @@ def run_request(
         "seed": seed,
         "width": width,
         "height": height,
-        "submit_perf_ns": time.perf_counter_ns(),
-        "submit_wall_ns": time.time_ns(),
     }
     request_dir = output_dir / "requests" / request_id
     request_dir.mkdir(parents=True, exist_ok=True)
+    record["submit_perf_ns"] = time.perf_counter_ns()
+    record["submit_wall_ns"] = time.time_ns()
     try:
         result = client.generate(
             text=prompt,
@@ -82,8 +82,12 @@ def run_request(
             height=height,
             think_mode=False,
             cfg_branch_policy=policy,
+            cfg_text_scale=4.0,
+            cfg_img_scale=1.0,
+            cfg_interval=[0.4, 1.0],
         )
         complete_perf_ns = time.perf_counter_ns()
+        complete_wall_ns = time.time_ns()
         if len(result.images) != 1 or not result.images[0]:
             raise RuntimeError(
                 f"expected one nonempty image, received {len(result.images)}"
@@ -95,7 +99,7 @@ def run_request(
             "status": "success",
             "server_request_id": result.request_id,
             "complete_perf_ns": complete_perf_ns,
-            "complete_wall_ns": time.time_ns(),
+            "complete_wall_ns": complete_wall_ns,
             "client_elapsed_seconds": (
                 complete_perf_ns - record["submit_perf_ns"]
             ) / 1e9,
