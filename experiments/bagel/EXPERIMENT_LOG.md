@@ -140,3 +140,14 @@ will not support throughput or tail-latency conclusions. After inspecting it,
 choose arrival patterns and a larger paired repeat count based on warmed
 latency, memory headroom, and observed variability before implementing any
 concurrency mechanism.
+
+### Colab plotting preflight repair
+
+The first Step 2 setup attempt completed dependency installation and both
+repository tests, but the combined import probe failed only at Matplotlib.
+Separate probes confirmed PyTorch 2.9.1+cu128, an A100-SXM4-80GB CUDA kernel,
+and FlashInfer 0.6.14 were healthy. Colab had exported
+`MPLBACKEND=module://matplotlib_inline.backend_inline` into the isolated
+serving environment, which does not include the notebook-only backend. The
+plotting script and preflight now force Matplotlib's noninteractive `Agg`
+backend before import; no serving dependency or GPU repair was required.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -52,6 +53,10 @@ def main() -> int:
     output_dir = (args.output_dir or input_dir / "plots").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Colab exports its notebook-only inline backend to child processes. The
+    # isolated serving venv intentionally does not install Jupyter, so force a
+    # headless backend before importing Matplotlib.
+    os.environ["MPLBACKEND"] = "Agg"
     import matplotlib
 
     matplotlib.use("Agg")

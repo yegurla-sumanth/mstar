@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -87,6 +88,8 @@ class BagelProfilePlotTest(unittest.TestCase):
             ]
             (root / "gpu_samples.json").write_text(json.dumps({"samples": samples}))
             output = root / "plots"
+            env = os.environ.copy()
+            env["MPLBACKEND"] = "module://matplotlib_inline.backend_inline"
             subprocess.run(
                 [
                     sys.executable,
@@ -98,6 +101,7 @@ class BagelProfilePlotTest(unittest.TestCase):
                 ],
                 check=True,
                 capture_output=True,
+                env=env,
                 text=True,
             )
             for filename in (
