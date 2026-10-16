@@ -359,7 +359,10 @@ captured post-step boundary (0, 20, 40, 41, and 48). Both `late_main` and
 `auto` are exact through step 40, first diverge at step 41 with relative L2
 error 0.001000, and reach 0.004892 at step 48. Their final image has PSNR
 51.522 dB, mean absolute pixel error 0.209, maximum pixel error 76, and 83.44%
-exactly equal channel values relative to `reference`.
+exactly equal channel values relative to `reference`. Direct comparison of
+the serialized latent-storage bytes also shows `auto` and `late_main` are
+bit-identical to one another at all five captured steps, isolating all observed
+drift to the one-row late-step transition.
 
 Trace-derived refinement CUDA totals were 44.345 seconds for `reference`,
 30.182 for `drop_image`, 39.838 for `late_main`, and 27.974 for `auto`. Typical
