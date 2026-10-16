@@ -122,6 +122,38 @@ def image_cfg_labels_for_inputs(inputs: list) -> tuple[str, ...]:
     return next(iter(signatures))
 
 
+def bagel_execution_trace_metadata(
+    graph_walk: str,
+    request_ids: list[int],
+    inputs: list,
+) -> dict:
+    """Describe prepared BAGEL CFG rows without touching tensor payloads."""
+    if graph_walk != "image_gen":
+        return {}
+    if len(request_ids) != len(inputs):
+        raise ValueError(
+            "BAGEL trace metadata requires one prepared input per request"
+        )
+    labels_by_handle = {}
+    rows_by_handle = {}
+    for request_id, inp in zip(request_ids, inputs, strict=True):
+        info = inp.resource_step_info
+        labels = (
+            info.active_labels
+            if isinstance(info, CFGStepInfo)
+            else CFG_BRANCH_ORDER
+            if bool(info)
+            else ("main",)
+        )
+        labels_by_handle[str(request_id)] = list(labels)
+        rows_by_handle[str(request_id)] = len(labels)
+    return {
+        "cfg_active_labels_by_request_handle": labels_by_handle,
+        "cfg_virtual_rows_by_request_handle": rows_by_handle,
+        "cfg_total_virtual_rows": sum(rows_by_handle.values()),
+    }
+
+
 def active_labels(graph_walk: str, cfg: bool, node_name: str) -> list[str]:
     """Cache labels a node touches on this walk.
 
@@ -869,6 +901,16 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _get_active_labels(self, graph_walk: str, cfg: bool):
         return active_labels(graph_walk, cfg, self.node_name)
+
+    def execution_trace_metadata(
+        self,
+        graph_walk: str,
+        request_ids: list[int],
+        inputs: list[ARNodeInputs],
+    ) -> dict:
+        return bagel_execution_trace_metadata(
+            graph_walk, request_ids, inputs
+        )
 
     def cg_key_info(
         self, graph_walk: str,

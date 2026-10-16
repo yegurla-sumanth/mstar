@@ -342,6 +342,7 @@ class ExecutingBatch:
     trace_component_start_ns: int | None = None
     trace_cuda_start_event: Any | None = None
     trace_cuda_end_event: Any | None = None
+    trace_model_metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         self.per_request_info_wrapped = {
@@ -773,6 +774,18 @@ class Engine:
         finally:
             if self._enable_nvtx:
                 range_pop()
+
+    def execution_trace_metadata(
+        self, batch: ExecutingBatch,
+    ) -> dict[str, Any]:
+        """Ask the active model node to describe its prepared execution rows."""
+        if batch.inputs is None:
+            return {}
+        return self._submodules[batch.node_name].submodule.execution_trace_metadata(
+            batch.step_context.graph_walk,
+            list(batch.request_ids),
+            batch.inputs,
+        )
 
     def _prepare_inputs(self, batch: ExecutingBatch) -> None:
         mgmt = self._submodules[batch.node_name]

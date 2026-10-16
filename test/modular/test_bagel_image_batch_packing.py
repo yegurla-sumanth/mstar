@@ -25,8 +25,10 @@ from mstar.model.bagel.batching import (
     split_image_gen_outputs,
 )
 from mstar.model.bagel.submodules import (
+    CFGStepInfo,
     LLMSubmodule,
     _store_projected_image_latents,
+    bagel_execution_trace_metadata,
 )
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -54,6 +56,41 @@ def _row(*, value: float, time_index: int, latent_len: int = 3) -> ARNodeInputs:
 
 
 class ImageBatchPackingTest(unittest.TestCase):
+    def test_execution_trace_reports_prepared_cfg_rows(self):
+        inputs = [
+            ARNodeInputs(
+                input_seq_len=5,
+                resource_step_info=CFGStepInfo(
+                    requires_cfg=True,
+                    active_labels=("main", "cfg_text"),
+                ),
+            ),
+            ARNodeInputs(
+                input_seq_len=5,
+                resource_step_info=CFGStepInfo(
+                    requires_cfg=True,
+                    active_labels=("main",),
+                ),
+            ),
+        ]
+
+        metadata = bagel_execution_trace_metadata(
+            "image_gen", [7, 11], inputs
+        )
+
+        self.assertEqual(metadata["cfg_total_virtual_rows"], 3)
+        self.assertEqual(
+            metadata["cfg_active_labels_by_request_handle"],
+            {"7": ["main", "cfg_text"], "11": ["main"]},
+        )
+        self.assertEqual(
+            metadata["cfg_virtual_rows_by_request_handle"],
+            {"7": 2, "11": 1},
+        )
+        self.assertEqual(
+            bagel_execution_trace_metadata("decode", [7], inputs[:1]), {}
+        )
+
     def test_debug_latents_use_wire_request_id_not_recycled_handle(self):
         outputs = {
             "latents": [torch.tensor([[1.0, 2.0]])],

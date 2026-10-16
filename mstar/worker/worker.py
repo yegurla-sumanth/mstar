@@ -1969,6 +1969,9 @@ class Worker:
                 else None
             )
             if self.execution_trace.enabled:
+                node_batch.trace_model_metadata = (
+                    engine.execution_trace_metadata(node_batch)
+                )
                 node_batch.trace_component_start_ns = _time.perf_counter_ns()
                 self.execution_trace.record(
                     "component_start",
@@ -1989,6 +1992,7 @@ class Worker:
                         str(rid): ns for rid, ns in batch.trace_ready_ns.items()
                     },
                     component_start_ns=node_batch.trace_component_start_ns,
+                    model_metadata=node_batch.trace_model_metadata,
                 )
                 if execution_stream is not None:
                     node_batch.trace_cuda_start_event = torch.Event(
@@ -3048,6 +3052,7 @@ class Worker:
                     / 1e6
                 ),
                 cuda_duration_ms=cuda_duration_ms,
+                model_metadata=batch_N.node_batch.trace_model_metadata,
             )
 
         _pp_stage("completion_event_sync")

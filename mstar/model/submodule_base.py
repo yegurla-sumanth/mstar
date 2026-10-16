@@ -590,6 +590,22 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> NodeInputs:
         pass
 
+    def execution_trace_metadata(
+        self,
+        graph_walk: str,
+        request_ids: list[int],
+        inputs: list[NodeInputs],
+    ) -> dict[str, Any]:
+        """Return JSON-serializable facts about the prepared execution rows.
+
+        The hook is diagnostic only and must not synchronize the device or
+        inspect tensor values. Model implementations can expose lightweight
+        control-plane facts that a generic worker cannot infer, such as the
+        CFG branches physically represented by a prepared BAGEL image step.
+        """
+        del graph_walk, request_ids, inputs
+        return {}
+
     def split_inputs(
         self,
         graph_walk: str,
@@ -1007,5 +1023,4 @@ class ARNodeSubmodule(NodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]: # input name to tensor
         pass
-
 
