@@ -44,6 +44,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-latents", action="store_true",
                         help="Diagnostic gate only; synchronizes selected steps, invalidates performance timing")
     parser.add_argument(
+        "--capture-latent-steps",
+        default="0,20,40,41,48",
+        help=(
+            "Comma-separated post-step indexes to save when --capture-latents "
+            "is enabled. Diagnostic only; each dump synchronizes the GPU."
+        ),
+    )
+    parser.add_argument(
         "--image-batch-max-size",
         type=int,
         default=1,
@@ -62,6 +70,18 @@ def main() -> int:
     args = parse_args()
     if args.image_batch_max_size < 1:
         raise ValueError("--image-batch-max-size must be at least 1")
+    try:
+        capture_steps = tuple(
+            int(value) for value in args.capture_latent_steps.split(",")
+            if value.strip()
+        )
+    except ValueError as exc:
+        raise ValueError("--capture-latent-steps must be comma-separated integers") from exc
+    if args.capture_latents and (
+        not capture_steps or len(set(capture_steps)) != len(capture_steps)
+        or any(step < 0 or step > 48 for step in capture_steps)
+    ):
+        raise ValueError("Captured BAGEL latent steps must be unique values in 0..48")
     repo_root = args.repo_root.resolve()
     config = args.config if args.config.is_absolute() else repo_root / args.config
     output_dir = args.output_dir.resolve()
@@ -146,7 +166,9 @@ def main() -> int:
     env.pop("MSTAR_BAGEL_DEBUG_LATENT_STEPS", None)
     if args.capture_latents:
         env["MSTAR_BAGEL_DEBUG_LATENT_DIR"] = str(output_dir / "debug_latents")
-        env["MSTAR_BAGEL_DEBUG_LATENT_STEPS"] = "0,20,40,41,48"
+        env["MSTAR_BAGEL_DEBUG_LATENT_STEPS"] = ",".join(
+            str(step) for step in capture_steps
+        )
     started_utc = datetime.now(timezone.utc)
     summary = {
         "status": "running",
@@ -166,6 +188,7 @@ def main() -> int:
             "cfg_branch_policy": args.cfg_branch_policy,
             "base_seed": args.base_seed,
             "latent_capture_enabled": args.capture_latents,
+            "latent_capture_steps": list(capture_steps) if args.capture_latents else [],
             "torch_compile_disabled": env.get("TORCH_COMPILE_DISABLE") == "1",
         },
         "server_command": server_command,
