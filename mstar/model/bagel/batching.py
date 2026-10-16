@@ -74,9 +74,11 @@ def collate_image_gen_inputs(inputs: list[ARNodeInputs]) -> dict[str, Any]:
                 f"rows, but observed {latent_observed}"
             )
 
+        # Value checks are useful in CPU tests, but reading a CUDA scalar here
+        # would synchronize the hot denoising path on every request and step.
         for name in ("text_indexes", "vae_token_indexes"):
             indexes = tensors[name]
-            if indexes.numel() and (
+            if indexes.device.type == "cpu" and indexes.numel() and (
                 int(indexes.min().item()) < 0
                 or int(indexes.max().item()) >= seq_len
             ):
@@ -97,3 +99,121 @@ def collate_image_gen_inputs(inputs: list[ARNodeInputs]) -> dict[str, Any]:
     result["seq_lens"] = seq_lens
     result["latent_lens"] = latent_lens
     return result
+
+
+def combine_cfg_velocities(
+    v_main: torch.Tensor,
+    v_cfg_text: torch.Tensor,
+    v_cfg_img: torch.Tensor,
+    timestep: torch.Tensor,
+    latent_lens: list[int],
+    *,
+    cfg_text_scale: float,
+    cfg_img_scale: float,
+    cfg_interval: tuple[float, float] | list[float],
+    cfg_renorm_type: str,
+    cfg_renorm_min: float,
+) -> torch.Tensor:
+    """Apply BAGEL CFG without coupling independent request rows.
+
+    Timesteps and effective CFG phases may differ between requests. Channel
+    renormalization is naturally row-local; global renormalization must be
+    computed independently over each request's latent block rather than over
+    the entire temporary model batch.
+    """
+    if not (
+        v_main.shape == v_cfg_text.shape == v_cfg_img.shape
+        and v_main.shape[0] == timestep.numel() == sum(latent_lens)
+    ):
+        raise ValueError(
+            "BAGEL CFG tensors, timesteps, and latent lengths do not describe "
+            "the same packed rows"
+        )
+    if any(length <= 0 for length in latent_lens):
+        raise ValueError("BAGEL CFG latent lengths must be positive")
+    if cfg_renorm_type not in {"global", "channel", "text_channel"}:
+        raise ValueError(
+            f"Unsupported BAGEL CFG renormalization: {cfg_renorm_type!r}"
+        )
+
+    cfg_lo, cfg_hi = cfg_interval
+    in_cfg_interval = ((timestep > cfg_lo) & (timestep <= cfg_hi)).to(
+        dtype=v_main.dtype
+    )
+    scale_shape = (-1,) + (1,) * (v_main.ndim - 1)
+    in_cfg_interval = in_cfg_interval.reshape(scale_shape)
+    effective_text_scale = (
+        cfg_text_scale * in_cfg_interval + (1 - in_cfg_interval)
+    )
+    effective_img_scale = (
+        cfg_img_scale * in_cfg_interval + (1 - in_cfg_interval)
+    )
+
+    v_text_guided = v_cfg_text + effective_text_scale * (
+        v_main - v_cfg_text
+    )
+    if cfg_renorm_type == "text_channel":
+        norm_v = torch.norm(v_main, dim=-1, keepdim=True)
+        norm_v_text = torch.norm(v_text_guided, dim=-1, keepdim=True)
+        scale = (norm_v / (norm_v_text + 1e-8)).clamp(
+            min=cfg_renorm_min, max=1.0
+        )
+        v_text_guided = v_text_guided * scale
+        image_guided = v_cfg_img + effective_img_scale * (
+            v_text_guided - v_cfg_img
+        )
+        return torch.where(
+            effective_img_scale > 1.0, image_guided, v_text_guided
+        )
+
+    image_guided = v_cfg_img + effective_img_scale * (
+        v_text_guided - v_cfg_img
+    )
+    v_combined = torch.where(
+        effective_img_scale > 1.0, image_guided, v_text_guided
+    )
+    if cfg_renorm_type == "channel":
+        renorm_scale = (
+            v_main.norm(dim=-1, keepdim=True)
+            / (v_combined.norm(dim=-1, keepdim=True) + 1e-8)
+        ).clamp(min=cfg_renorm_min, max=1.0)
+        return v_combined * renorm_scale
+
+    main_chunks = v_main.split(latent_lens)
+    combined_chunks = v_combined.split(latent_lens)
+    outputs = []
+    for main, combined in zip(main_chunks, combined_chunks, strict=True):
+        renorm_scale = (
+            main.norm() / (combined.norm() + 1e-8)
+        ).clamp(min=cfg_renorm_min, max=1.0)
+        outputs.append(combined * renorm_scale)
+    return torch.cat(outputs)
+
+
+def split_image_gen_outputs(
+    request_ids: list[Any],
+    latents: torch.Tensor,
+    time_index: torch.Tensor,
+    latent_lens: list[int],
+) -> dict[Any, dict[str, list[torch.Tensor]]]:
+    """Restore packed latent rows to their request-addressed output shape."""
+    if len(request_ids) != len(latent_lens):
+        raise ValueError(
+            "BAGEL image outputs need one latent length per request"
+        )
+    total = sum(latent_lens)
+    if latents.shape[0] != total or time_index.shape[0] != total:
+        raise ValueError(
+            "BAGEL image output tensors do not match their request boundaries"
+        )
+    latent_rows = latents.split(latent_lens)
+    time_rows = time_index.split(latent_lens)
+    return {
+        rid: {
+            "latents": [latent],
+            "time_index": [step],
+        }
+        for rid, latent, step in zip(
+            request_ids, latent_rows, time_rows, strict=True
+        )
+    }

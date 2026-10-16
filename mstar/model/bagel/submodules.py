@@ -23,7 +23,11 @@ from mstar.engine.cuda_graph_config import (
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
-from mstar.model.bagel.batching import collate_image_gen_inputs
+from mstar.model.bagel.batching import (
+    collate_image_gen_inputs,
+    combine_cfg_velocities,
+    split_image_gen_outputs,
+)
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -703,6 +707,13 @@ class LLMSubmodule(ARNodeSubmodule):
         self.eoi_token_id = eoi_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+        self._image_gen_batch_max_size = int(
+            os.environ.get("MSTAR_BAGEL_IMAGE_BATCH_MAX_SIZE", "1")
+        )
+        if self._image_gen_batch_max_size < 1:
+            raise ValueError(
+                "MSTAR_BAGEL_IMAGE_BATCH_MAX_SIZE must be at least 1"
+            )
 
     def _get_image_pos_ids(
         self, labels: list[str],
@@ -1267,6 +1278,8 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
+        kwargs.pop("seq_lens", None)
+        latent_lens = kwargs.pop("latent_lens", None)
 
         latents = input_embeds
 
@@ -1278,7 +1291,15 @@ class LLMSubmodule(ARNodeSubmodule):
         n_latent = latents.shape[0]
         torch._check(vae_position_ids.shape[0] == n_latent)
         torch._check(time_index.shape[0] == n_latent)
-        torch._check(empty_combined_emb.shape[0] == n_latent + 2)
+        torch._check(vae_token_indexes.shape[0] == n_latent)
+        torch._check(text_mask.shape[0] == empty_combined_emb.shape[0])
+        if latent_lens is None:
+            latent_lens = [int(n_latent)]
+        if sum(latent_lens) != int(n_latent):
+            raise ValueError(
+                "BAGEL image-generation latent boundaries do not match the "
+                f"packed latent tensor: {latent_lens} vs {int(n_latent)}"
+            )
 
         N = self.config.num_timesteps
         shift = self.config.timestep_shift
@@ -1289,14 +1310,16 @@ class LLMSubmodule(ARNodeSubmodule):
         t_uniform_next = 1.0 - (time_index + 1) / (N - 1)
         timestep = self._apply_timestep_shift(t=t_uniform, shift=shift)
         timestep_next = self._apply_timestep_shift(t=t_uniform_next, shift=shift)
-        dt = (timestep - timestep_next)[0]  # positive step size
+        dt = timestep - timestep_next  # one positive step size per latent row
 
         pos_embed = self.latent_pos_embed(vae_position_ids)
         timestep_embeds = self.time_embedder(timestep)
         latents_ = self.vae2llm(latents) + timestep_embeds \
             + pos_embed
 
-        empty_combined_emb[1:-1] = latents_
+        # Every request contributes its own BOI/latent/EOI block. The collator
+        # converted request-local VAE indexes into this packed sequence.
+        empty_combined_emb[vae_token_indexes] = latents_
         logger.debug("packed_seq = %s", empty_combined_emb)  # tensor repr: keep lazy
 
         if requires_cfg:
@@ -1304,15 +1327,7 @@ class LLMSubmodule(ARNodeSubmodule):
             cfg_img_scale = kwargs.pop("cfg_img_scale", self.config.cfg_img_scale)
             renorm_type = kwargs.pop("cfg_renorm_type", self.config.cfg_renorm_type)
 
-            # CFG interval: only apply guidance when timestep is within interval
             cfg_interval = kwargs.pop("cfg_interval", self.config.cfg_interval)
-            cfg_lo, cfg_hi = cfg_interval
-
-            # torch.compile compatible logic
-            t_val = timestep[0]
-            in_cfg_interval = ((t_val > cfg_lo) & (t_val <= cfg_hi)).float()
-            effective_text_scale = cfg_text_scale * in_cfg_interval + 1.0 * (1 - in_cfg_interval)
-            effective_img_scale = cfg_img_scale * in_cfg_interval + 1.0 * (1 - in_cfg_interval)
 
             # Batched CFG: run all 3 branches in a single LLM forward.
             # plan_attention_batched_cfg created a single FlashInfer plan
@@ -1338,43 +1353,26 @@ class LLMSubmodule(ARNodeSubmodule):
                 **kwargs,
             )
 
-            # Split output back to 3 branches and project to VAE space
-            v_main = self.llm2vae(hidden[:S])[1:-1]
-            v_cfg_text = self.llm2vae(hidden[S:2*S])[1:-1]
-            v_cfg_img = self.llm2vae(hidden[2*S:])[1:-1]
+            # Split output back to 3 branches and select every request's
+            # latent rows from its own BOI/latent/EOI block.
+            v_main = self.llm2vae(hidden[:S])[vae_token_indexes]
+            v_cfg_text = self.llm2vae(hidden[S:2*S])[vae_token_indexes]
+            v_cfg_img = self.llm2vae(hidden[2*S:])[vae_token_indexes]
 
             # Two-node CFG velocity combination + renormalization
             cfg_renorm_min = kwargs.pop("cfg_renorm_min", self.config.cfg_renorm_min)
-
-            if renorm_type == "text_channel":
-                # text_channel: renorm AFTER text CFG, THEN apply image CFG
-                v_text_guided = v_cfg_text + effective_text_scale * (v_main - v_cfg_text)
-                norm_v = torch.norm(v_main, dim=-1, keepdim=True)
-                norm_v_text = torch.norm(v_text_guided, dim=-1, keepdim=True)
-                scale = (norm_v / (norm_v_text + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
-                v_text_renormed = v_text_guided * scale
-                if effective_img_scale > 1.0:
-                    v_final = v_cfg_img + effective_img_scale * (v_text_renormed - v_cfg_img)
-                else:
-                    v_final = v_text_renormed
-            else:
-                # global / channel: apply both text+image CFG, THEN renorm
-                v_text_guided = v_cfg_text + effective_text_scale * (v_main - v_cfg_text)
-                if effective_img_scale > 1.0:
-                    v_combined = v_cfg_img + effective_img_scale * (v_text_guided - v_cfg_img)
-                else:
-                    v_combined = v_text_guided
-
-                if renorm_type == "channel":
-                    renorm_scale = (
-                        v_main.norm(dim=-1, keepdim=True) /
-                        (v_combined.norm(dim=-1, keepdim=True) + 1e-8)
-                    ).clamp(min=cfg_renorm_min, max=1.0)
-                else:
-                    renorm_scale = (
-                        v_main.norm() / (v_combined.norm() + 1e-8)
-                    ).clamp(min=cfg_renorm_min, max=1.0)
-                v_final = v_combined * renorm_scale
+            v_final = combine_cfg_velocities(
+                v_main,
+                v_cfg_text,
+                v_cfg_img,
+                timestep,
+                latent_lens,
+                cfg_text_scale=cfg_text_scale,
+                cfg_img_scale=cfg_img_scale,
+                cfg_interval=cfg_interval,
+                cfg_renorm_type=renorm_type,
+                cfg_renorm_min=cfg_renorm_min,
+            )
         else:
             # No CFG: single forward pass over the declared plan
             hidden = self.language_model(
@@ -1385,9 +1383,10 @@ class LLMSubmodule(ARNodeSubmodule):
                 text_mask=text_mask,
                 **kwargs,
             )
-            v_final = self.llm2vae(hidden)[1:-1]
+            v_final = self.llm2vae(hidden)[vae_token_indexes]
 
         # Euler step: x_{t-dt} = x_t - v * dt  (velocity points data -> noise)
+        dt = dt.reshape((-1,) + (1,) * (latents.ndim - 1))
         latents = latents - v_final * dt
         if torch.is_autocast_enabled():
             latents = latents.to(torch.get_autocast_gpu_dtype())
@@ -1484,14 +1483,62 @@ class LLMSubmodule(ARNodeSubmodule):
         requires_cfg: bool=False,
         **kwargs
     ) -> dict[str, NameToTensorList]:
-        """Batched forward pass for decode and prefill_text.
+        """Batched forward pass for supported autoregressive and image walks.
 
         Concatenates inputs across requests, runs a single LLM forward with
         one batched attention plan, then splits outputs back per-request.
         """
         request_ids = engine_inputs.request_ids
 
-        if graph_walk == "decode":
+        if graph_walk == "image_gen":
+            if input_embeds is None:
+                raise ValueError("Batched BAGEL image generation needs latents")
+            latent_lens = kwargs.get("latent_lens")
+            if latent_lens is None or len(latent_lens) != len(request_ids):
+                raise ValueError(
+                    "Batched BAGEL image generation needs one latent length "
+                    "per request"
+                )
+
+            # These affect the math rather than tensor layout. can_batch()
+            # admits only a homogeneous configured group, while the effective
+            # CFG phase remains per request because it comes from timestep.
+            metadata_keys = (
+                "cfg_text_scale",
+                "cfg_img_scale",
+                "cfg_interval",
+                "cfg_renorm_type",
+                "cfg_renorm_min",
+            )
+            infos = [
+                engine_inputs.per_request_info[rid].step_metadata
+                for rid in request_ids
+            ]
+            for key in metadata_keys:
+                default = getattr(self.config, key)
+                values = [info.get(key, default) for info in infos]
+                normalized = [
+                    tuple(value) if isinstance(value, list) else value
+                    for value in values
+                ]
+                if any(value != normalized[0] for value in normalized[1:]):
+                    raise ValueError(
+                        f"Mixed BAGEL {key} values reached one image batch"
+                    )
+                kwargs[key] = values[0]
+
+            out = self._forward_image_gen(
+                input_embeds=input_embeds,
+                requires_cfg=requires_cfg,
+                **kwargs,
+            )
+            return split_image_gen_outputs(
+                request_ids,
+                out["latents"][0],
+                out["time_index"][0],
+                latent_lens,
+            )
+        elif graph_walk == "decode":
             out = self._forward_decode_batched(
                 input_ids=input_ids,
                 requires_cfg=requires_cfg,
@@ -1569,12 +1616,65 @@ class LLMSubmodule(ARNodeSubmodule):
     def max_batch_size(self, graph_walk: str):
         if graph_walk == "prefill_vit":
             return 2
+        if graph_walk == "image_gen":
+            return self._image_gen_batch_max_size
         return None
 
     def can_batch(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ):
-        return batch.graph_walk in ["decode", "prefill_text", "prefill_vit"]
+        if batch.graph_walk in ["decode", "prefill_text", "prefill_vit"]:
+            return True
+        if batch.graph_walk != "image_gen" or len(model_inputs) < 2:
+            return False
+        if len(model_inputs) > self._image_gen_batch_max_size:
+            return False
+
+        # Initial implementation deliberately accepts only equal tensor
+        # layouts. Current refinement step/time is absent from this key: that
+        # is the heterogeneous state the batched forward is designed to carry.
+        layout_keys = set()
+        for inp in model_inputs:
+            if not isinstance(inp, ARNodeInputs) or inp.input_embeds is None:
+                return False
+            tensors = inp.tensor_inputs
+            required = {
+                "empty_combined_emb", "vae_position_ids", "text_indexes",
+                "vae_token_indexes", "text_mask", "time_index",
+            }
+            if required.difference(tensors):
+                return False
+            layout_keys.add((
+                bool(inp.resource_step_info),
+                int(inp.input_seq_len),
+                tuple(inp.input_embeds.shape),
+                inp.input_embeds.dtype,
+                tuple(tensors["empty_combined_emb"].shape),
+                tensors["empty_combined_emb"].dtype,
+            ))
+        if len(layout_keys) != 1:
+            return False
+
+        metadata_keys = (
+            "requires_cfg",
+            "cfg_text_scale",
+            "cfg_img_scale",
+            "cfg_interval",
+            "cfg_renorm_type",
+            "cfg_renorm_min",
+        )
+        configured = set()
+        for info in batch.per_request_info.values():
+            metadata = info.step_metadata
+            values = []
+            for key in metadata_keys:
+                default = (
+                    False if key == "requires_cfg" else getattr(self.config, key)
+                )
+                value = metadata.get(key, default)
+                values.append(tuple(value) if isinstance(value, list) else value)
+            configured.add(tuple(values))
+        return len(configured) == 1
 
     def postprocess(
         self, request_id: str,

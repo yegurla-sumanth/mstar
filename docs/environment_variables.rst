@@ -172,6 +172,13 @@ model, so they are named for it.
      - ``1,2,4``
      - Comma-separated batch sizes to capture. Read only when
        ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
+   * - ``MSTAR_BAGEL_IMAGE_BATCH_MAX_SIZE``
+     - ``1``
+     - Experimental cap for true BAGEL ``image_gen`` model batching. ``1``
+       preserves serial image refinement. Set ``2`` only after validating the
+       heterogeneous-step path on the target GPU; requests must still share
+       latent/packed geometry and configured CFG settings, but may be at
+       different refinement steps.
    * - ``MSTAR_OMNIVOICE_MODEL_PATH``
      - unset
      - OmniVoice: load weights from this local directory instead of the

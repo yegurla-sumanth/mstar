@@ -35,6 +35,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--num-requests", type=int, default=6)
     parser.add_argument("--stagger-seconds", type=float, default=8.0)
+    parser.add_argument(
+        "--image-batch-max-size",
+        type=int,
+        default=1,
+        help=(
+            "Experimental true image_gen batch cap; 1 preserves the serial "
+            "baseline"
+        ),
+    )
     parser.add_argument("--server-start-timeout-seconds", type=float, default=1800.0)
     parser.add_argument("--shutdown-timeout-seconds", type=float, default=90.0)
     parser.add_argument("--request-timeout-seconds", type=float, default=1800.0)
@@ -43,6 +52,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.image_batch_max_size < 1:
+        raise ValueError("--image-batch-max-size must be at least 1")
     repo_root = args.repo_root.resolve()
     config = args.config if args.config.is_absolute() else repo_root / args.config
     output_dir = args.output_dir.resolve()
@@ -104,6 +115,9 @@ def main() -> int:
         {
             "CUDA_VISIBLE_DEVICES": "0",
             "MSTAR_EXECUTION_TRACE_DIR": str(trace_dir),
+            "MSTAR_BAGEL_IMAGE_BATCH_MAX_SIZE": str(
+                args.image_batch_max_size
+            ),
             "MSTAR_RUST_ZMQ": "0",
             "PATH": (venv_bin if not inherited_path else os.pathsep.join((venv_bin, inherited_path))),
             "PYTHONUNBUFFERED": "1",
@@ -123,6 +137,7 @@ def main() -> int:
             "warmup_requests": 1,
             "measured_requests": args.num_requests,
             "stagger_seconds": args.stagger_seconds,
+            "image_batch_max_size": args.image_batch_max_size,
         },
         "server_command": server_command,
         "client_command": client_command,
@@ -131,6 +146,7 @@ def main() -> int:
             for key in (
                 "CUDA_VISIBLE_DEVICES",
                 "MSTAR_EXECUTION_TRACE_DIR",
+                "MSTAR_BAGEL_IMAGE_BATCH_MAX_SIZE",
                 "MSTAR_RUST_ZMQ",
                 "PATH",
                 "PYTHONUNBUFFERED",

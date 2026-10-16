@@ -11,7 +11,11 @@ import unittest
 
 import torch
 
-from mstar.model.bagel.batching import collate_image_gen_inputs
+from mstar.model.bagel.batching import (
+    collate_image_gen_inputs,
+    combine_cfg_velocities,
+    split_image_gen_outputs,
+)
 from mstar.model.submodule_base import ARNodeInputs
 
 
@@ -111,6 +115,141 @@ class ImageBatchPackingTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "missing inputs.*time_index"):
             collate_image_gen_inputs([row])
+
+
+class HeterogeneousCFGTest(unittest.TestCase):
+    def _combine(
+        self, timestep, latent_lens, renorm_type="global", rows=slice(None)
+    ):
+        v_main = torch.tensor([
+            [1.0, 2.0], [2.0, 1.0],
+            [10.0, 1.0], [1.0, 10.0],
+        ])[rows]
+        v_text = torch.tensor([
+            [0.5, 0.0], [0.0, 0.5],
+            [20.0, 2.0], [2.0, 20.0],
+        ])[rows]
+        v_image = torch.tensor([
+            [0.25, 0.25], [0.25, 0.25],
+            [30.0, 3.0], [3.0, 30.0],
+        ])[rows]
+        return combine_cfg_velocities(
+            v_main, v_text, v_image, torch.tensor(timestep), latent_lens,
+            cfg_text_scale=4.0,
+            cfg_img_scale=1.5,
+            cfg_interval=(0.4, 1.0),
+            cfg_renorm_type=renorm_type,
+            cfg_renorm_min=0.0,
+        )
+
+    def test_global_renorm_matches_independent_request_combinations(self):
+        batched = self._combine([0.8, 0.8, 0.2, 0.2], [2, 2])
+        first = self._combine([0.8, 0.8], [2], rows=slice(0, 2))
+        second = self._combine([0.2, 0.2], [2], rows=slice(2, 4))
+
+        torch.testing.assert_close(batched, torch.cat([first, second]))
+
+    def test_request_outside_cfg_interval_reduces_to_main_velocity(self):
+        combined = self._combine([0.8, 0.8, 0.2, 0.2], [2, 2])
+        expected_main = torch.tensor([[10.0, 1.0], [1.0, 10.0]])
+
+        torch.testing.assert_close(combined[2:], expected_main)
+
+    def test_all_supported_renorm_modes_keep_shape_and_finiteness(self):
+        for renorm_type in ("global", "channel", "text_channel"):
+            with self.subTest(renorm_type=renorm_type):
+                combined = self._combine(
+                    [0.8, 0.8, 0.2, 0.2], [2, 2], renorm_type
+                )
+                self.assertEqual(combined.shape, (4, 2))
+                self.assertTrue(torch.isfinite(combined).all())
+
+    def test_single_request_cfg_matches_the_previous_scalar_formula(self):
+        v_main = torch.tensor([[1.0, 2.0], [2.0, 1.0]])
+        v_text = torch.tensor([[0.5, 0.0], [0.0, 0.5]])
+        v_image = torch.tensor([[0.25, 0.25], [0.25, 0.25]])
+
+        for timestep_value in (0.8, 0.2):
+            in_interval = float(0.4 < timestep_value <= 1.0)
+            text_scale = 4.0 * in_interval + 1.0 * (1 - in_interval)
+            image_scale = 1.5 * in_interval + 1.0 * (1 - in_interval)
+            for renorm_type in ("global", "channel", "text_channel"):
+                with self.subTest(
+                    timestep=timestep_value, renorm_type=renorm_type
+                ):
+                    text_guided = v_text + text_scale * (v_main - v_text)
+                    if renorm_type == "text_channel":
+                        scale = (
+                            v_main.norm(dim=-1, keepdim=True)
+                            / (text_guided.norm(dim=-1, keepdim=True) + 1e-8)
+                        ).clamp(min=0.0, max=1.0)
+                        text_guided = text_guided * scale
+                        expected = (
+                            v_image + image_scale * (text_guided - v_image)
+                            if image_scale > 1.0 else text_guided
+                        )
+                    else:
+                        combined = (
+                            v_image + image_scale * (text_guided - v_image)
+                            if image_scale > 1.0 else text_guided
+                        )
+                        norm = (
+                            v_main.norm(dim=-1, keepdim=True)
+                            / (combined.norm(dim=-1, keepdim=True) + 1e-8)
+                            if renorm_type == "channel"
+                            else v_main.norm() / (combined.norm() + 1e-8)
+                        )
+                        expected = combined * norm.clamp(min=0.0, max=1.0)
+
+                    actual = combine_cfg_velocities(
+                        v_main,
+                        v_text,
+                        v_image,
+                        torch.full((2,), timestep_value),
+                        [2],
+                        cfg_text_scale=4.0,
+                        cfg_img_scale=1.5,
+                        cfg_interval=(0.4, 1.0),
+                        cfg_renorm_type=renorm_type,
+                        cfg_renorm_min=0.0,
+                    )
+                    torch.testing.assert_close(actual, expected)
+
+
+class ImageBatchOutputSplittingTest(unittest.TestCase):
+    def test_outputs_return_to_their_request_ids(self):
+        latents = torch.tensor([
+            [1.0, 1.0], [1.0, 2.0],
+            [2.0, 1.0], [2.0, 2.0],
+        ])
+        time_index = torch.tensor([4, 4, 21, 21])
+
+        outputs = split_image_gen_outputs(
+            ["request-a", "request-b"], latents, time_index, [2, 2]
+        )
+
+        self.assertEqual(set(outputs), {"request-a", "request-b"})
+        torch.testing.assert_close(
+            outputs["request-a"]["latents"][0], latents[:2]
+        )
+        torch.testing.assert_close(
+            outputs["request-b"]["latents"][0], latents[2:]
+        )
+        torch.testing.assert_close(
+            outputs["request-a"]["time_index"][0], torch.tensor([4, 4])
+        )
+        torch.testing.assert_close(
+            outputs["request-b"]["time_index"][0], torch.tensor([21, 21])
+        )
+
+    def test_outputs_reject_inconsistent_boundaries(self):
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            split_image_gen_outputs(
+                ["request-a", "request-b"],
+                torch.zeros(3, 2),
+                torch.zeros(3),
+                [2, 2],
+            )
 
 
 if __name__ == "__main__":
