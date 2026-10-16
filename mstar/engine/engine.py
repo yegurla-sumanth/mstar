@@ -558,6 +558,16 @@ class Engine:
         default mode (fullgraph=False, dynamic=None), which in general provides
         performance gains without frequent slow recompiles.
         """
+        # PyTorch also reads TORCH_COMPILE_DISABLE internally. Check it here
+        # before wrapping the functions so an explicitly eager diagnostic run
+        # is unambiguous in both its stack traces and the engine log.
+        if os.environ.get("TORCH_COMPILE_DISABLE", "0") == "1":
+            logger.info(
+                "Engine: torch.compile globally disabled by "
+                "TORCH_COMPILE_DISABLE=1"
+            )
+            return
+
         if not torch.cuda.is_available():
             return
 

@@ -644,6 +644,27 @@ def _init_latents_and_time_index(
     return latents, time_idx
 
 
+def _store_projected_image_latents(
+    combined_emb: torch.Tensor,
+    vae_token_indexes: torch.Tensor | slice,
+    projected_latents: torch.Tensor,
+) -> torch.Tensor:
+    """Write projected latents without relying on compiler-inserted casts.
+
+    The initial noise and its BOI/EOI-wrapped sequence are created outside
+    the engine's autocast region and can therefore be fp32.  The projection
+    modules run inside bf16 autocast.  Eager indexed assignment requires the
+    source and destination dtypes to match, while the compiled path previously
+    hid this mismatch.  Preserve the destination buffer's declared dtype
+    explicitly so eager and compiled execution implement the same storage
+    operation.
+    """
+    combined_emb[vae_token_indexes] = projected_latents.to(
+        dtype=combined_emb.dtype
+    )
+    return combined_emb
+
+
 class LLMSubmodule(ARNodeSubmodule):
     """Fat LLM wrapper that dispatches based on graph walk.
 
@@ -1480,7 +1501,9 @@ class LLMSubmodule(ARNodeSubmodule):
 
         # Every request contributes its own BOI/latent/EOI block. The collator
         # converted request-local VAE indexes into this packed sequence.
-        empty_combined_emb[vae_token_indexes] = latents_
+        _store_projected_image_latents(
+            empty_combined_emb, vae_token_indexes, latents_
+        )
         logger.debug("packed_seq = %s", empty_combined_emb)  # tensor repr: keep lazy
 
         cfg_text_scale = kwargs.pop(
@@ -1609,7 +1632,11 @@ class LLMSubmodule(ARNodeSubmodule):
         timestep_embeds = self.time_embedder(timestep)
 
         latents_ = self.vae2llm(latents) + timestep_embeds + pos_embed
-        empty_combined_emb[1:-1] = latents_
+        _store_projected_image_latents(
+            empty_combined_emb,
+            slice(1, -1),
+            latents_,
+        )
 
         label = self._NODE_TO_CFG_LABEL.get(self.node_name, "main")
         hidden = self.language_model(

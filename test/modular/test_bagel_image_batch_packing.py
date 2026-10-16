@@ -19,6 +19,7 @@ from mstar.model.bagel.batching import (
     shifted_timestep_for_step,
     split_image_gen_outputs,
 )
+from mstar.model.bagel.submodules import _store_projected_image_latents
 from mstar.model.submodule_base import ARNodeInputs
 
 
@@ -45,6 +46,21 @@ def _row(*, value: float, time_index: int, latent_len: int = 3) -> ARNodeInputs:
 
 
 class ImageBatchPackingTest(unittest.TestCase):
+    def test_projected_latents_are_stored_in_sequence_dtype(self):
+        combined = torch.zeros((5, 2), dtype=torch.float32)
+        indexes = torch.tensor([1, 2, 3])
+        projected = torch.full((3, 2), 1.5, dtype=torch.bfloat16)
+
+        actual = _store_projected_image_latents(
+            combined, indexes, projected
+        )
+
+        self.assertIs(actual, combined)
+        self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(
+            actual[indexes], projected.to(dtype=torch.float32)
+        )
+
     def test_image_rows_offset_local_indexes_into_the_packed_sequence(self):
         first = _row(value=1, time_index=3)
         second = _row(value=2, time_index=20)
