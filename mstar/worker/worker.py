@@ -1603,6 +1603,17 @@ class Worker:
                 wire_ids.append(f"removed-handle-{request_id}")
         return wire_ids
 
+    @staticmethod
+    def _trace_dynamic_loop_iters(
+        node_batch: ExecutingBatch,
+    ) -> dict[str, dict[str, int]]:
+        """Snapshot the per-request progress a diagnostic batch executed."""
+        return {
+            str(rid): dict(info.dynamic_loop_iter_counts)
+            for rid, info in node_batch.per_request_info.items()
+            if rid in node_batch.request_ids
+        }
+
     def _prepare_trace_batch(
         self,
         batch: ScheduledBatch,
@@ -1969,6 +1980,9 @@ class Worker:
                         node_batch.request_ids
                     ),
                     batch_size=len(node_batch.request_ids),
+                    dynamic_loop_iter_counts=(
+                        self._trace_dynamic_loop_iters(node_batch)
+                    ),
                     speculative=batch.trace_speculative,
                     scheduled_ns=batch.trace_scheduled_ns,
                     ready_observed_ns={
@@ -3019,6 +3033,9 @@ class Worker:
                 request_handles=request_ids,
                 request_ids=self._trace_wire_request_ids(request_ids),
                 batch_size=len(request_ids),
+                dynamic_loop_iter_counts=(
+                    self._trace_dynamic_loop_iters(batch_N.node_batch)
+                ),
                 speculative=batch_N.batch.trace_speculative,
                 component_start_ns=batch_N.node_batch.trace_component_start_ns,
                 gpu_complete_ns=completed_ns,
