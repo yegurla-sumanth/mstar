@@ -3,6 +3,7 @@
 # ---------------------------------------------------------------------------
 
 
+import hashlib
 import logging
 import os
 import re
@@ -1215,7 +1216,17 @@ class LLMSubmodule(ARNodeSubmodule):
         if graph_walk == "prefill_vae":
             return self._forward_prefill_vae(**kwargs)
         elif graph_walk == "image_gen":
-            out = self._forward_image_gen(**kwargs)
+            debug_context = None
+            if os.environ.get("MSTAR_BAGEL_DEBUG_STAGE_DIR"):
+                debug_context = ((
+                    str(request_info.request_id),
+                    int(request_info.dynamic_loop_iter_counts.get(
+                        "image_gen_loop", 0
+                    )),
+                ),)
+            out = self._forward_image_gen(
+                debug_context=debug_context, **kwargs
+            )
             self._maybe_dump_image_latents(request_info, out)
             return out
         elif graph_walk == "image_gen_cfg":
@@ -1286,6 +1297,194 @@ class LLMSubmodule(ARNodeSubmodule):
             temporary,
         )
         os.replace(temporary, path)
+
+    @staticmethod
+    def _maybe_dump_image_stages(
+        *,
+        debug_context: tuple[tuple[str, int], ...],
+        seq_lens: list[int],
+        latent_lens: list[int],
+        labels: tuple[str, ...],
+        input_latents: torch.Tensor,
+        output_latents: torch.Tensor,
+        input_time_index: torch.Tensor,
+        output_time_index: torch.Tensor,
+        timestep: torch.Tensor,
+        dt: torch.Tensor,
+        vae_position_ids: torch.Tensor,
+        text_indexes: torch.Tensor,
+        vae_token_indexes: torch.Tensor,
+        vae_projection: torch.Tensor,
+        timestep_embeds: torch.Tensor,
+        pos_embed: torch.Tensor,
+        projected_latents: torch.Tensor,
+        transformer_input: torch.Tensor,
+        hidden: torch.Tensor,
+        branch_velocities: Mapping[str, torch.Tensor],
+        combined_velocity: torch.Tensor,
+    ) -> None:
+        """Save per-request internal fingerprints for a correctness run.
+
+        The production path never calls this method. Stage capture synchronizes
+        and copies tensors to CPU, so it must not be enabled for performance.
+        Every packed tensor is split back to request-local coordinates. Large
+        tensors are represented by a collision-resistant digest, statistics,
+        and a deterministic sample rather than being serialized in full. This
+        keeps a short operator-localization run from producing gigabytes of
+        artifacts while preserving exact equality checks.
+        """
+        root = os.environ.get("MSTAR_BAGEL_DEBUG_STAGE_DIR")
+        if not root:
+            return
+        selected_steps = {
+            int(value)
+            for value in os.environ.get(
+                "MSTAR_BAGEL_DEBUG_STAGE_STEPS", "0,1"
+            ).split(",")
+            if value.strip()
+        }
+        target_prefix = os.environ.get(
+            "MSTAR_BAGEL_DEBUG_STAGE_REQUEST_PREFIX", "bagel-measured-00-"
+        )
+        selected = [
+            index
+            for index, (request_id, step) in enumerate(debug_context)
+            if (
+                request_id.startswith(target_prefix) and step in selected_steps
+            ) or (
+                request_id.startswith("bagel-measured-") and step == 0
+            )
+        ]
+        if not selected:
+            return
+
+        latent_tensors = {
+            "input_latent": input_latents,
+            "input_time_index": input_time_index,
+            "output_time_index": output_time_index,
+            "shifted_timestep": timestep,
+            "euler_dt": dt,
+            "vae_position_ids": vae_position_ids,
+            "vae_projection": vae_projection,
+            "timestep_embedding": timestep_embeds,
+            "position_embedding": pos_embed,
+            "projected_latent": projected_latents,
+            "transformer_input_latent_tokens": transformer_input[
+                vae_token_indexes
+            ],
+            "combined_velocity": combined_velocity,
+            "output_latent_pre_split": output_latents,
+        }
+        sequence_span = int(transformer_input.shape[0])
+        for label_index, label in enumerate(labels):
+            branch_hidden = hidden[
+                label_index * sequence_span:(label_index + 1) * sequence_span
+            ]
+            latent_tensors[f"hidden_{label}"] = branch_hidden[
+                vae_token_indexes
+            ]
+            latent_tensors[f"velocity_{label}"] = branch_velocities[label]
+
+        latent_chunks = {
+            name: tensor.split(latent_lens)
+            for name, tensor in latent_tensors.items()
+        }
+        sequence_chunks = transformer_input.split(seq_lens)
+        vae_index_chunks = vae_token_indexes.split(latent_lens)
+        seq_offsets = []
+        offset = 0
+        for length in seq_lens:
+            seq_offsets.append(offset)
+            offset += length
+
+        def fingerprint(tensor: torch.Tensor) -> dict[str, Any]:
+            cpu = tensor.detach().contiguous().to(device="cpu", copy=True)
+            flat = cpu.reshape(-1)
+            byte_view = cpu.view(torch.uint8).reshape(-1).numpy()
+            sample_size = min(4096, flat.numel())
+            if sample_size == flat.numel():
+                sample_indexes = torch.arange(flat.numel(), dtype=torch.int64)
+            elif sample_size:
+                sample_indexes = torch.linspace(
+                    0, flat.numel() - 1, steps=sample_size, dtype=torch.int64
+                )
+            else:
+                sample_indexes = torch.empty(0, dtype=torch.int64)
+            sample = flat.index_select(0, sample_indexes)
+            numeric = sample.double()
+            return {
+                "shape": list(cpu.shape),
+                "dtype": str(cpu.dtype),
+                "numel": flat.numel(),
+                "sha256": hashlib.sha256(byte_view).hexdigest(),
+                "finite": bool(torch.isfinite(cpu).all()),
+                "sample_mean": float(numeric.mean()) if sample_size else 0.0,
+                "sample_l2_norm": float(numeric.norm()) if sample_size else 0.0,
+                "sample_max_abs": (
+                    float(numeric.abs().max()) if sample_size else 0.0
+                ),
+                "sample_indexes": sample_indexes,
+                "sample_values": sample,
+                # Small tensors are cheap to keep and permit exact error norms.
+                "values": cpu if flat.numel() <= 65536 else None,
+            }
+
+        for index in selected:
+            request_id, step = debug_context[index]
+            seq_start = seq_offsets[index]
+            seq_end = seq_start + seq_lens[index]
+            local_text_indexes = text_indexes[
+                (text_indexes >= seq_start) & (text_indexes < seq_end)
+            ] - seq_start
+            local_vae_indexes = vae_index_chunks[index] - seq_start
+            is_target = request_id.startswith(target_prefix)
+            if is_target:
+                stages = {
+                    name: fingerprint(chunks[index])
+                    for name, chunks in latent_chunks.items()
+                }
+                stages["transformer_input_sequence"] = fingerprint(
+                    sequence_chunks[index]
+                )
+                stages["local_text_indexes"] = fingerprint(local_text_indexes)
+                stages["local_vae_token_indexes"] = fingerprint(
+                    local_vae_indexes
+                )
+                capture_kind = "full_stage_fingerprints"
+            else:
+                stages = {
+                    "input_latent": fingerprint(
+                        latent_chunks["input_latent"][index]
+                    )
+                }
+                capture_kind = "partner_input_probe"
+
+            safe_request_id = re.sub(
+                r"[^A-Za-z0-9_.-]+", "_", request_id
+            )
+            request_dir = Path(root) / safe_request_id
+            request_dir.mkdir(parents=True, exist_ok=True)
+            path = request_dir / f"step_{step:02d}.pt"
+            if path.exists():
+                raise RuntimeError(f"Duplicate BAGEL stage capture: {path}")
+            temporary = path.with_suffix(".tmp")
+            torch.save(
+                {
+                    "request_id": request_id,
+                    "step_index": step,
+                    "batch_size": len(debug_context),
+                    "batch_request_ids": [row[0] for row in debug_context],
+                    "batch_steps": [row[1] for row in debug_context],
+                    "request_batch_index": index,
+                    "seq_lens": list(seq_lens),
+                    "latent_lens": list(latent_lens),
+                    "cfg_labels": list(labels),
+                    "capture_kind": capture_kind,
+                    "stages": stages,
+                },
+                temporary,
+            )
+            os.replace(temporary, path)
 
     def _forward_prefill_text(
         self, input_ids: torch.Tensor,
@@ -1447,6 +1646,7 @@ class LLMSubmodule(ARNodeSubmodule):
         cfg_interval: tuple[float, float] | list[float],
         cfg_renorm_type: str,
         cfg_renorm_min: float,
+        debug_branch_velocities: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Project and combine a runtime-selected set of CFG branches.
 
@@ -1464,6 +1664,8 @@ class LLMSubmodule(ARNodeSubmodule):
             )[vae_token_indexes]
             for i, label in enumerate(labels)
         }
+        if debug_branch_velocities is not None:
+            debug_branch_velocities.update(branch_velocities)
         return combine_pruned_cfg_velocities(
             branch_velocities,
             timestep,
@@ -1486,6 +1688,7 @@ class LLMSubmodule(ARNodeSubmodule):
         time_index: torch.Tensor,
         requires_cfg: bool = True,
         cfg_active_labels: tuple[str, ...] | list[str] | None = None,
+        debug_context: tuple[tuple[str, int], ...] | None = None,
         **kwargs,
     ) -> NameToTensorList:
         """Flow matching Euler step with optional 3-pass CFG.
@@ -1505,7 +1708,7 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
-        kwargs.pop("seq_lens", None)
+        seq_lens = kwargs.pop("seq_lens", None)
         latent_lens = kwargs.pop("latent_lens", None)
 
         latents = input_embeds
@@ -1527,6 +1730,21 @@ class LLMSubmodule(ARNodeSubmodule):
                 "BAGEL image-generation latent boundaries do not match the "
                 f"packed latent tensor: {latent_lens} vs {int(n_latent)}"
             )
+        if seq_lens is None:
+            seq_lens = [int(empty_combined_emb.shape[0])]
+        if sum(seq_lens) != int(empty_combined_emb.shape[0]):
+            raise ValueError(
+                "BAGEL image-generation sequence boundaries do not match the "
+                f"packed sequence: {seq_lens} vs "
+                f"{int(empty_combined_emb.shape[0])}"
+            )
+        if debug_context is not None and (
+            len(debug_context) != len(latent_lens)
+            or len(debug_context) != len(seq_lens)
+        ):
+            raise ValueError(
+                "BAGEL stage-capture request context does not match the batch"
+            )
 
         N = self.config.num_timesteps
         shift = self.config.timestep_shift
@@ -1541,8 +1759,8 @@ class LLMSubmodule(ARNodeSubmodule):
 
         pos_embed = self.latent_pos_embed(vae_position_ids)
         timestep_embeds = self.time_embedder(timestep)
-        latents_ = self.vae2llm(latents) + timestep_embeds \
-            + pos_embed
+        vae_projection = self.vae2llm(latents)
+        latents_ = vae_projection + timestep_embeds + pos_embed
 
         # Every request contributes its own BOI/latent/EOI block. The collator
         # converted request-local VAE indexes into this packed sequence.
@@ -1607,6 +1825,7 @@ class LLMSubmodule(ARNodeSubmodule):
             text_mask=batched_text_mask,
             **kwargs,
         )
+        debug_branch_velocities = {} if debug_context is not None else None
         v_final = self._project_and_combine_cfg_velocities(
             hidden,
             labels,
@@ -1619,6 +1838,7 @@ class LLMSubmodule(ARNodeSubmodule):
             cfg_interval=cfg_interval,
             cfg_renorm_type=renorm_type,
             cfg_renorm_min=cfg_renorm_min,
+            debug_branch_velocities=debug_branch_velocities,
         )
 
         # Euler step: x_{t-dt} = x_t - v * dt  (velocity points data -> noise)
@@ -1626,6 +1846,30 @@ class LLMSubmodule(ARNodeSubmodule):
         latents = latents - v_final * dt
         if torch.is_autocast_enabled():
             latents = latents.to(torch.get_autocast_gpu_dtype())
+        if debug_context is not None:
+            self._maybe_dump_image_stages(
+                debug_context=debug_context,
+                seq_lens=seq_lens,
+                latent_lens=latent_lens,
+                labels=labels,
+                input_latents=input_embeds,
+                output_latents=latents,
+                input_time_index=time_index,
+                output_time_index=time_index + 1,
+                timestep=timestep,
+                dt=dt.reshape(-1),
+                vae_position_ids=vae_position_ids,
+                text_indexes=text_indexes,
+                vae_token_indexes=vae_token_indexes,
+                vae_projection=vae_projection,
+                timestep_embeds=timestep_embeds,
+                pos_embed=pos_embed,
+                projected_latents=latents_,
+                transformer_input=empty_combined_emb,
+                hidden=hidden,
+                branch_velocities=debug_branch_velocities or {},
+                combined_velocity=v_final,
+            )
         return {
             "latents": [latents],
             "time_index": [time_index + 1]
@@ -1769,9 +2013,21 @@ class LLMSubmodule(ARNodeSubmodule):
                     )
                 kwargs[key] = values[0]
 
+            debug_context = None
+            if os.environ.get("MSTAR_BAGEL_DEBUG_STAGE_DIR"):
+                debug_context = tuple(
+                    (
+                        str(engine_inputs.per_request_info[rid].request_id),
+                        int(engine_inputs.per_request_info[
+                            rid
+                        ].dynamic_loop_iter_counts.get("image_gen_loop", 0)),
+                    )
+                    for rid in request_ids
+                )
             out = self._forward_image_gen(
                 input_embeds=input_embeds,
                 requires_cfg=requires_cfg,
+                debug_context=debug_context,
                 **kwargs,
             )
             split = split_image_gen_outputs(

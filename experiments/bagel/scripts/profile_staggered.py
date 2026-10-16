@@ -51,6 +51,10 @@ def parse_args() -> argparse.Namespace:
         default="A red panda reading a systems paper in a university library",
     )
     parser.add_argument("--base-seed", type=int, default=20261016)
+    parser.add_argument(
+        "--measured-seeds",
+        help="Optional comma-separated seed per measured request",
+    )
     parser.add_argument("--cfg-branch-policy", choices=("reference", "drop_image"), default="reference")
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--width", type=int, default=1024)
@@ -188,6 +192,19 @@ def main() -> int:
         raise ValueError("Request and warm-up counts must be positive")
     if args.stagger_seconds < 0:
         raise ValueError("--stagger-seconds must be non-negative")
+    measured_seeds = None
+    if args.measured_seeds:
+        try:
+            measured_seeds = [
+                int(value) for value in args.measured_seeds.split(",")
+                if value.strip()
+            ]
+        except ValueError as exc:
+            raise ValueError("--measured-seeds must contain integers") from exc
+        if len(measured_seeds) != args.num_requests:
+            raise ValueError(
+                "--measured-seeds must contain exactly --num-requests values"
+            )
 
     require_local_storage(args.output_dir)
     from mstar import MStarClient
@@ -210,6 +227,11 @@ def main() -> int:
             "stagger_seconds": args.stagger_seconds,
             "prompt": args.prompt,
             "base_seed": args.base_seed,
+            "measured_seeds": (
+                measured_seeds
+                if measured_seeds is not None
+                else [args.base_seed + index for index in range(args.num_requests)]
+            ),
             "width": args.width,
             "height": args.height,
             "expected_num_timesteps": 50,
@@ -232,7 +254,13 @@ def main() -> int:
                 request_id=f"bagel-{phase}-{index:02d}-{run_tag}",
                 request_index=index if phase == "measured" else -index - 1,
                 phase=phase, prompt=args.prompt,
-                seed=args.base_seed + index if phase == "measured" else args.base_seed - index - 1,
+                seed=(
+                    measured_seeds[index]
+                    if phase == "measured" and measured_seeds is not None
+                    else args.base_seed + index
+                    if phase == "measured"
+                    else args.base_seed - index - 1
+                ),
                 width=args.width, height=args.height,
                 timeout_seconds=args.timeout_seconds,
                 target_perf_ns=start + int(index * args.stagger_seconds * 1e9),

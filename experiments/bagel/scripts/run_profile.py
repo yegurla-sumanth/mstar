@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stagger-seconds", type=float, default=8.0)
     parser.add_argument("--cfg-branch-policy", choices=("reference", "drop_image"), default="reference")
     parser.add_argument("--base-seed", type=int, default=20261016)
+    parser.add_argument("--measured-seeds")
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--capture-latents", action="store_true",
@@ -60,6 +61,32 @@ def parse_args() -> argparse.Namespace:
             "baseline"
         ),
     )
+    parser.add_argument(
+        "--image-gen-max-iters",
+        type=int,
+        help=(
+            "Diagnostic early stop for the graph loop. The model retains its "
+            "original num_timesteps and timestep schedule."
+        ),
+    )
+    parser.add_argument(
+        "--capture-stages",
+        action="store_true",
+        help="Save selected internal image-refinement tensors; diagnostic only",
+    )
+    parser.add_argument(
+        "--capture-stage-steps",
+        default="0,1",
+        help="Comma-separated refinement steps for internal stage capture",
+    )
+    parser.add_argument(
+        "--capture-stage-request-prefix",
+        default="bagel-measured-00-",
+        help=(
+            "Only matching measured requests receive full stage fingerprints; "
+            "other measured requests receive a compact step-0 input probe"
+        ),
+    )
     parser.add_argument("--server-start-timeout-seconds", type=float, default=1800.0)
     parser.add_argument("--shutdown-timeout-seconds", type=float, default=90.0)
     parser.add_argument("--request-timeout-seconds", type=float, default=1800.0)
@@ -70,6 +97,8 @@ def main() -> int:
     args = parse_args()
     if args.image_batch_max_size < 1:
         raise ValueError("--image-batch-max-size must be at least 1")
+    if args.image_gen_max_iters is not None and not 1 <= args.image_gen_max_iters <= 49:
+        raise ValueError("--image-gen-max-iters must be in 1..49")
     try:
         capture_steps = tuple(
             int(value) for value in args.capture_latent_steps.split(",")
@@ -82,6 +111,44 @@ def main() -> int:
         or any(step < 0 or step > 48 for step in capture_steps)
     ):
         raise ValueError("Captured BAGEL latent steps must be unique values in 0..48")
+    try:
+        stage_capture_steps = tuple(
+            int(value) for value in args.capture_stage_steps.split(",")
+            if value.strip()
+        )
+    except ValueError as exc:
+        raise ValueError("--capture-stage-steps must contain integers") from exc
+    if args.capture_stages and (
+        not stage_capture_steps
+        or len(set(stage_capture_steps)) != len(stage_capture_steps)
+        or any(step < 0 or step > 48 for step in stage_capture_steps)
+    ):
+        raise ValueError("Captured BAGEL stage steps must be unique values in 0..48")
+    if (
+        args.image_gen_max_iters is not None
+        and any(step >= args.image_gen_max_iters for step in capture_steps)
+        and args.capture_latents
+    ):
+        raise ValueError("Latent capture steps must be below --image-gen-max-iters")
+    if (
+        args.image_gen_max_iters is not None
+        and any(step >= args.image_gen_max_iters for step in stage_capture_steps)
+        and args.capture_stages
+    ):
+        raise ValueError("Stage capture steps must be below --image-gen-max-iters")
+    measured_seeds = None
+    if args.measured_seeds:
+        try:
+            measured_seeds = [
+                int(value) for value in args.measured_seeds.split(",")
+                if value.strip()
+            ]
+        except ValueError as exc:
+            raise ValueError("--measured-seeds must contain integers") from exc
+        if len(measured_seeds) != args.num_requests:
+            raise ValueError(
+                "--measured-seeds must contain exactly --num-requests values"
+            )
     repo_root = args.repo_root.resolve()
     config = args.config if args.config.is_absolute() else repo_root / args.config
     output_dir = args.output_dir.resolve()
@@ -140,6 +207,8 @@ def main() -> int:
         "--base-seed", str(args.base_seed),
         "--warmup-requests", str(args.warmup_requests),
     ]
+    if args.measured_seeds:
+        client_command.extend(["--measured-seeds", args.measured_seeds])
     env = os.environ.copy()
     # Keep the invoked interpreter path instead of resolving its symlink: uv
     # virtual environments may point at a system interpreter, while tools such
@@ -164,10 +233,24 @@ def main() -> int:
         env["TORCH_COMPILE_DISABLE"] = "1"
     env.pop("MSTAR_BAGEL_DEBUG_LATENT_DIR", None)
     env.pop("MSTAR_BAGEL_DEBUG_LATENT_STEPS", None)
+    env.pop("MSTAR_BAGEL_DEBUG_STAGE_DIR", None)
+    env.pop("MSTAR_BAGEL_DEBUG_STAGE_STEPS", None)
+    env.pop("MSTAR_BAGEL_DEBUG_STAGE_REQUEST_PREFIX", None)
+    env.pop("MSTAR_BAGEL_IMAGE_GEN_MAX_ITERS", None)
+    if args.image_gen_max_iters is not None:
+        env["MSTAR_BAGEL_IMAGE_GEN_MAX_ITERS"] = str(args.image_gen_max_iters)
     if args.capture_latents:
         env["MSTAR_BAGEL_DEBUG_LATENT_DIR"] = str(output_dir / "debug_latents")
         env["MSTAR_BAGEL_DEBUG_LATENT_STEPS"] = ",".join(
             str(step) for step in capture_steps
+        )
+    if args.capture_stages:
+        env["MSTAR_BAGEL_DEBUG_STAGE_DIR"] = str(output_dir / "debug_stages")
+        env["MSTAR_BAGEL_DEBUG_STAGE_STEPS"] = ",".join(
+            str(step) for step in stage_capture_steps
+        )
+        env["MSTAR_BAGEL_DEBUG_STAGE_REQUEST_PREFIX"] = (
+            args.capture_stage_request_prefix
         )
     started_utc = datetime.now(timezone.utc)
     summary = {
@@ -187,8 +270,20 @@ def main() -> int:
             "image_batch_max_size": args.image_batch_max_size,
             "cfg_branch_policy": args.cfg_branch_policy,
             "base_seed": args.base_seed,
+            "measured_seeds": (
+                measured_seeds if measured_seeds is not None else None
+            ),
             "latent_capture_enabled": args.capture_latents,
             "latent_capture_steps": list(capture_steps) if args.capture_latents else [],
+            "stage_capture_enabled": args.capture_stages,
+            "stage_capture_steps": (
+                list(stage_capture_steps) if args.capture_stages else []
+            ),
+            "stage_capture_request_prefix": (
+                args.capture_stage_request_prefix if args.capture_stages else None
+            ),
+            "image_gen_max_iters": args.image_gen_max_iters,
+            "configured_num_timesteps": 50,
             "torch_compile_disabled": env.get("TORCH_COMPILE_DISABLE") == "1",
         },
         "server_command": server_command,
@@ -199,10 +294,12 @@ def main() -> int:
                 "CUDA_VISIBLE_DEVICES",
                 "MSTAR_EXECUTION_TRACE_DIR",
                 "MSTAR_BAGEL_IMAGE_BATCH_MAX_SIZE",
+                "MSTAR_BAGEL_IMAGE_GEN_MAX_ITERS",
+                "MSTAR_BAGEL_DEBUG_STAGE_REQUEST_PREFIX",
                 "MSTAR_RUST_ZMQ",
                 "PATH",
                 "PYTHONUNBUFFERED",
-            )
+            ) if key in env
         },
         "nvidia_smi_before": command_result(["nvidia-smi"], repo_root),
     }

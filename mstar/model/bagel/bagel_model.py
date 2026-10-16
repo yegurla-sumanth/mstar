@@ -32,6 +32,7 @@ processed causally, then each image is processed bidirectionally.
 import io
 import json
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -945,6 +946,16 @@ class BagelModel(Model):
         return super().get_worker_graphs(config_path)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
+        default_image_iters = self.config.num_timesteps - 1
+        image_iters = int(os.environ.get(
+            "MSTAR_BAGEL_IMAGE_GEN_MAX_ITERS", default_image_iters
+        ))
+        if not 1 <= image_iters <= default_image_iters:
+            raise ValueError(
+                "MSTAR_BAGEL_IMAGE_GEN_MAX_ITERS must be between 1 and "
+                f"{default_image_iters}, received {image_iters}"
+            )
+
         # -- prefill_text: just the LLM node (text embedding is internal) --
         # No output needed — conductor is notified when the worker graph completes.
         prefill_text = GraphNode(
@@ -1041,7 +1052,10 @@ class BagelModel(Model):
                     enable_async_scheduling=not self._image_gen_remote_handoff,
                 ),
                 name="image_gen_loop",
-                max_iters=self.config.num_timesteps - 1,
+                # A diagnostic may stop the graph early while retaining the
+                # original config.num_timesteps in every timestep/dt formula.
+                # This is not equivalent to changing the diffusion schedule.
+                max_iters=image_iters,
                 outputs=[
                     GraphEdge(next_node="vae_decoder", name="latents"),
                 ],
@@ -1111,7 +1125,7 @@ class BagelModel(Model):
                     ),
                 ]),
                 name="image_gen_cfg_loop",
-                max_iters=self.config.num_timesteps - 1,
+                max_iters=image_iters,
                 outputs=[
                     GraphEdge(next_node="vae_decoder", name="latents"),
                 ],
