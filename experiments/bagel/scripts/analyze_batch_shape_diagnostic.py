@@ -56,8 +56,14 @@ def trace_contract(
     *,
     cap: int,
     expected: str,
+    strict_expectation: bool = True,
 ) -> dict[str, Any]:
-    """Validate all measured transitions and classify their actual batching."""
+    """Validate transitions and classify actual batching.
+
+    Structural corruption always raises.  A requested scheduling pattern can
+    instead be reported as unrealized so an unattended diagnostic preserves
+    all numerical evidence without making the intended causal claim.
+    """
     if expected not in {"serial", "homogeneous", "heterogeneous"}:
         raise ValueError(f"Unknown trace expectation: {expected}")
     if not request_ids or len(request_ids) != len(set(request_ids)):
@@ -130,21 +136,30 @@ def trace_contract(
                 f"{request_id}: expected exactly steps 0..48; found {sorted(seen)}"
             )
 
+    expectation_violations = []
     if expected == "serial" and (same_age_batches or mixed_age_batches):
-        raise ValueError("Serial B=1 arm contains a measured multi-request batch")
+        expectation_violations.append(
+            "Serial B=1 arm contains a measured multi-request batch"
+        )
     if expected == "homogeneous" and (
         len(same_age_batches) < MIN_HOMOGENEOUS_BATCHES
         or mixed_age_batches
     ):
-        raise ValueError(
+        expectation_violations.append(
             "Homogeneous B=2 arm requires no mixed-age measured batches and at "
             f"least {MIN_HOMOGENEOUS_BATCHES} same-step measured batches"
         )
     if expected == "heterogeneous" and not mixed_age_batches:
-        raise ValueError("Heterogeneous B=2 arm has no measured mixed-age batch")
+        expectation_violations.append(
+            "Heterogeneous B=2 arm has no measured mixed-age batch"
+        )
+    if strict_expectation and expectation_violations:
+        raise ValueError("; ".join(expectation_violations))
 
     return {
         "expected": expected,
+        "expectation_satisfied": not expectation_violations,
+        "expectation_violations": expectation_violations,
         "steps_per_request": {
             request_id: len(steps) for request_id, steps in per_request.items()
         },
@@ -218,7 +233,7 @@ def compare_trajectory(
     }
 
 
-def _validated_runs(roots: dict[str, Path]) -> tuple[dict, dict, dict]:
+def _validated_runs(roots: dict[str, Path]) -> tuple[dict, dict, dict, str]:
     from compare_batch_parity import load_summary, measured_by_index
 
     summaries = {name: load_summary(root) for name, root in roots.items()}
@@ -282,6 +297,7 @@ def analyze(roots: dict[str, Path]) -> dict[str, Any]:
                 "homogeneous_b2": "homogeneous",
                 "heterogeneous_b2": "heterogeneous",
             }[name],
+            strict_expectation=False,
         )
         for name in roots
     }
@@ -316,22 +332,32 @@ def analyze(roots: dict[str, Path]) -> dict[str, Any]:
         comparisons[candidate_name] = trajectory_rows
         images[candidate_name] = image_rows
 
-    homogeneous_nonexact = any(
-        row["first_nonexact_step"] is not None
-        for row in comparisons["homogeneous_b2"]
-    )
-    heterogeneous_nonexact = any(
-        row["first_nonexact_step"] is not None
-        for row in comparisons["heterogeneous_b2"]
-    )
-    if homogeneous_nonexact and heterogeneous_nonexact:
-        assessment = "batching_general_candidate"
-    elif not homogeneous_nonexact and heterogeneous_nonexact:
-        assessment = "mixed_age_specific_candidate"
-    elif homogeneous_nonexact and not heterogeneous_nonexact:
-        assessment = "unexpected_homogeneous_only_drift"
+    invalid_arms = [
+        name
+        for name, trace in traces.items()
+        if not trace["expectation_satisfied"]
+    ]
+    if invalid_arms:
+        status = "diagnostic_inconclusive"
+        assessment = "requested_schedule_not_realized"
     else:
-        assessment = "exact_in_both_b2_arms"
+        status = "diagnostic_complete"
+        homogeneous_nonexact = any(
+            row["first_nonexact_step"] is not None
+            for row in comparisons["homogeneous_b2"]
+        )
+        heterogeneous_nonexact = any(
+            row["first_nonexact_step"] is not None
+            for row in comparisons["heterogeneous_b2"]
+        )
+        if homogeneous_nonexact and heterogeneous_nonexact:
+            assessment = "batching_general_candidate"
+        elif not homogeneous_nonexact and heterogeneous_nonexact:
+            assessment = "mixed_age_specific_candidate"
+        elif homogeneous_nonexact and not heterogeneous_nonexact:
+            assessment = "unexpected_homogeneous_only_drift"
+        else:
+            assessment = "exact_in_both_b2_arms"
 
     # The detailed per-step membership is embedded in trajectory rows. Avoid
     # duplicating it under the trace summary and inflating the report.
@@ -343,9 +369,10 @@ def analyze(roots: dict[str, Path]) -> dict[str, Any]:
         }
 
     return {
-        "status": "diagnostic_complete",
+        "status": status,
         "performance_authorized": False,
         "hypothesis_assessment": assessment,
+        "invalid_schedule_arms": invalid_arms,
         "workload": summaries["serial_b1"]["workload"],
         "code_revision": code_revision,
         "trace_contracts": trace_summaries,
@@ -353,10 +380,11 @@ def analyze(roots: dict[str, Path]) -> dict[str, Any]:
         "image_comparisons": images,
         "interpretation": (
             "All 49 saved post-step latents were compared by request index and seed. "
-            "A homogeneous-arm difference shows that B=2 shape alone can change the "
-            "trajectory; a difference unique to the heterogeneous arm points to an "
-            "additional mixed-age effect. No numerical acceptance threshold is imposed. "
-            "All timing is diagnostic because latent capture synchronizes CUDA."
+            "A causal batching-shape versus mixed-age classification is made only when "
+            "all requested trace contracts are satisfied. Otherwise the report preserves "
+            "the actual schedule and numerical comparisons as an inconclusive result. "
+            "No numerical acceptance threshold is imposed. All timing is diagnostic "
+            "because latent capture synchronizes CUDA."
         ),
     }
 

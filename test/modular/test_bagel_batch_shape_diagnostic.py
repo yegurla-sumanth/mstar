@@ -128,6 +128,13 @@ class BatchShapeDiagnosticTest(unittest.TestCase):
             trace_contract(
                 self.root, ["a", "b"], cap=2, expected="homogeneous"
             )
+        report = trace_contract(
+            self.root, ["a", "b"], cap=2, expected="homogeneous",
+            strict_expectation=False,
+        )
+        self.assertFalse(report["expectation_satisfied"])
+        self.assertEqual(report["same_age_batch_count"], MIN_HOMOGENEOUS_BATCHES - 1)
+        self.assertIn("at least 32 same-step", report["expectation_violations"][0])
 
     def test_heterogeneous_contract(self):
         rows = [event(["a"], [step], step) for step in range(16)]
